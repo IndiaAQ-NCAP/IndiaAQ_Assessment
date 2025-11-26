@@ -1,0 +1,2186 @@
+---
+title: "HEI report"
+author: "HEI"
+date: 28 Oct 2025
+format:
+  html:
+    toc: true
+    highlight-style: a11y
+    html-math-method: katex
+    code-copy: true
+    code-tools: true
+    self-contained: true
+    theme:
+      light: flatly
+      dark: darkly
+execute:
+  warning: false
+  message: false
+---
+
+## Data prep
+
+- bind all data into a single file hourly data here - `2025_04_12_HEI_hourly_data.rds`
+- Daily data here: `2025_04_12_HEI_daily_data_completeness.rds` 
+- Please remember the US Diplomatic stations are removed here and also NCAP cities are filtered.
+
+
+```{r}
+# install.packages("pacman")
+# tidyverse if for data wrangling
+# here is for clean relative paths
+# readxl is for reading xlsx
+# lubridate is for date time variable manipulation
+# data.table for data table considerations
+# openair to work with air quality data
+# zoo for rolling average
+
+pacman::p_load(tidyverse, here, readxl, lubridate, data.table, openair, zoo)
+
+# theme for all plots
+theme_HEI <- list(theme(legend.text = element_text(size = 11),
+                        legend.title = element_blank(),
+                        legend.position = "none",
+                        strip.text = element_text(size = 10, face = "bold", colour = "black"),
+                        plot.title = element_text(size = 12, face = "bold", colour = "black"),
+                        axis.title = element_text(size = 14, colour = "black"),
+                        axis.text = element_text(size = 12, colour = "black", face = "bold"),
+                        panel.border = element_rect(colour = "black", fill = NA, size = 1)))
+
+
+# Define variables for filtering
+format_dt <- "%Y-%m-%d %H:%M:%S"
+tz_asia <- "Asia/Kolkata"
+yes <- "Yes"
+no <- "No"
+
+## Define the thresholds for completeness
+threshold_hours <- 18
+threshold_days <- 23
+threshold_months <- 11
+naaqs_pm25_daily <- 60
+naaqs_pm10_daily <- 100
+
+## Define timezone
+tz_India <- "Asia/Kolkata"
+
+## Read paths in a clean way, List pollution files and defining a empty data frame to store the data, .Rproj file you need to open that file
+pollution_data_path <- here("data/CPCB/Pollutant")
+
+## Read the NCAP list of stations
+ncap_list <- read_xlsx(here("data", "Clean sheet_10-05-2024.xlsx"), sheet = 2) %>%
+  mutate(City_name = ifelse(City_name == "Amaravati", "Amravati", City_name),
+         City_name = ifelse(City_name == "Dharwad", "Hubballi", City_name)) %>%
+  filter(!is.na(City_name)) %>%
+  filter(City_name != 0) %>%
+  distinct(City_name)
+
+
+daily_all <- data.frame()
+monthly_all <- data.frame()
+yearly_all <- data.frame()
+hourly_all <- data.frame()
+
+pollution_data_list <- list.files(pollution_data_path)
+
+process_pollution_rolling_data <- function(data, pollutant_name, id_cols = c("location_name", "city_name",
+                                                                     "state_name", "district_name"),
+                                   alignment = "right", window = 3,
+                                   new_name_suffix = "_roll_avg") {
+  ## for columns of years add a column suffix of _level and the new names are roll_avg
+  long_data <- data %>%
+    pivot_longer(
+      cols = -id_cols,
+      names_to = "year",
+      values_to = paste0(pollutant_name, "_level")
+    ) %>%
+    mutate(year = as.character(year)) %>%
+    arrange(location_name, year)
+
+  long_data <- long_data %>%
+    group_by(location_name) %>%
+    mutate(!!paste0(pollutant_name, new_name_suffix) := rollapply(get(paste0(pollutant_name, "_level")),
+                                                                  width = window,
+                                                                  FUN = function(x) {
+                                                                    if (sum(!is.na(x)) == window) {
+                                                                      mean(x, na.rm = TRUE)
+                                                                    } else {
+                                                                      NaN
+                                                                    }
+                                                                  },
+                                                                  fill = NA,
+                                                                  align = alignment)) %>%
+    ungroup()
+
+  wide_data_with_avg <- long_data %>%
+    pivot_wider(
+      names_from = year,
+      values_from = c(!!paste0(pollutant_name, "_level"),
+                      !!paste0(pollutant_name, new_name_suffix)),
+      names_sep = "_"
+    ) %>%
+    rename_with(~ gsub("X", "", .))  # Remove all "X" from column names
+  return(wide_data_with_avg)
+}
+
+
+process_pollution_data <- function(path, file, threshold_hours, threshold_days, threshold_months,
+                                   format_dt, tz_asia, yes, no) {
+  pollutant_data <- read.csv(here(path, file))
+  # Convert observation_hour_start to datetime format
+  data <- pollutant_data %>%
+    mutate(observation_hour_start = as.POSIXct(observation_hour_start, format = format_dt, tz = tz_asia),
+           date = as.Date(observation_hour_start, tz = tz_asia),
+           hour = hour(observation_hour_start))
+
+  # Group by parameter, location_name, and date
+  daily_summary <- data %>%
+    group_by(date, parameter, city_name, state_name, location_name) %>%
+    summarise(
+      hours_available = n_distinct(hour, na.rm = T),
+      day_average = ifelse(hours_available >= threshold_hours, mean(average_value_in_hour, na.rm = T), NA),
+      day_completeness = ifelse(hours_available >= threshold_hours, yes, no)
+    )
+
+  # Check monthly completeness
+  monthly_summary <- daily_summary %>%
+    group_by(parameter, location_name, city_name, state_name, month = floor_date(date, "month")) %>%
+    summarise(
+      days_available = sum(day_completeness == yes),  # Count days with completeness "Yes"
+      month_completeness = ifelse(days_available >= threshold_days, yes, no)
+    )
+
+  yearly_summary <- monthly_summary %>%
+    group_by(parameter, location_name, city_name, state_name, year = year(month)) %>%
+    summarise(
+      months_available = sum(month_completeness == yes),  # Count days with completeness "Yes"
+      year_completeness = ifelse(months_available >= threshold_months, yes, no)
+    )
+
+  # Pivot wider to have parameters as columns
+  # result <- daily_summary %>%
+  #   left_join(monthly_summary, by = c("parameter", "location_name", "date" = "month")) %>%
+  #   pivot_wider(names_from = parameter, values_from = c(day_average, day_completeness))
+
+return(list(daily_summary, monthly_summary, yearly_summary, data)) # add data for hourly
+}
+
+
+# for(i in pollution_data_list){
+#   result <- process_pollution_data(pollution_data_path, i, threshold_hours, threshold_days, threshold_months,
+#                                    format_dt, tz_asia, yes, no)
+#   daily_data <- result[[1]] %>%
+#     mutate(file_name = i)
+#   monthly_data <- result[[2]] %>%
+#     mutate(file_name = i)
+#   yearly_data <- result[[3]] %>%
+#     mutate(file_name = i)
+#   hourly_data <- result[[4]] %>%
+#     mutate(file_name = i)
+#   if(nrow(daily_data) > 0) {
+#     daily_all <- rbind(daily_all, daily_data)
+#     monthly_all <- rbind(monthly_all, monthly_data)
+#     yearly_all <- rbind(yearly_all, yearly_data)
+#     hourly_all <- rbind(hourly_all, hourly_data)
+#   }
+# }
+
+# daily_all <- daily_all %>%
+#   mutate(year = lubridate::year(date),
+#          month = format(date, "%b"))
+# saveRDS(hourly_all, here("data", "2025_04_12_HEI_hourly_data.rds"))
+
+daily_all <- readRDS(here("data/05-11-2025 Report files", 
+                        "2025_04_12_HEI_daily_data_completeness.rds"))
+hourly_all <- readRDS(here("data/05-11-2025 Report files", 
+                           "2025_04_12_HEI_hourly_data.rds")) %>%
+  filter(!str_starts(location_name, "US Diplomatic Post:")) %>%
+  filter(city_name %in% unique(ncap_list$City_name)) ## filter for NCAP cities
+
+pm25 <- c("PM25")
+pm10 <- c("PM10")
+```
+
+## Tables 
+
+1. Total number of stations & cities for PM2.5 (2017-2024).csv 
+2. Total number of stations & cities for PM10 (2017-2024).csv 
+
+
+```{r}
+# hourly_all <- hourly_all %>%
+#   filter(!str_starts(location_name, "US Diplomatic Post:")) %>%
+#   filter(city_name %in% unique(ncap_list$City_name))
+# saveRDS(daily_all, "2025_04_12_HEI_daily_data_completeness.rds")
+
+hourly_pm25 <- hourly_all %>%
+  filter(parameter == pm25) %>%
+  mutate(year = year(observation_hour_start)) %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name),
+            n_cities = n_distinct(city_name))
+hourly_pm25_list <- hourly_all %>%
+  filter(parameter == pm25) %>%
+  mutate(year = year(observation_hour_start)) %>%
+  group_by(year) %>%
+  dplyr::select(year, location_name, city_name, state_name) %>%
+  distinct(across(everything()))
+View(hourly_pm25_list) # Abinaya this command is the view the data mentioned in the write.csv file here it being hourly_pm25_list line 229
+write.csv(hourly_pm25_list, here("2025_report", "Total number of stations & cities for PM2.5 (2017-2024).csv"), row.names = F)
+
+hourly_pm10 <- hourly_all %>%
+  filter(parameter == pm10) %>%
+  mutate(year = year(observation_hour_start)) %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name),
+            n_cities = n_distinct(city_name))
+hourly_pm10_list <- hourly_all %>%
+  filter(parameter == pm10) %>%
+  mutate(year = year(observation_hour_start)) %>%
+  group_by(year) %>%
+  dplyr::select(year, location_name, city_name, state_name) %>%
+  distinct(across(everything()))
+View(hourly_pm10_list) 
+write.csv(hourly_pm10_list, here("2025_report", 
+                                 "Total number of stations & cities for PM10 (2017-2024).csv"), 
+          row.names = F)
+```
+
+
+
+## Table 2
+
+- Table of stations in NCAP cities: 2025_PM25_no_of_stations_in_city_total_ncap.csv and 
+2025_PM10_no_of_stations_in_city_total_ncap.csv
+
+
+```{r}
+total_pm25_data_stations_city <- hourly_all %>%
+  filter(parameter == pm25) %>%
+  ungroup() %>%
+  group_by(city_name, state_name) %>%
+  summarise(n_stations = n_distinct(location_name))
+View(total_pm25_data_stations_city)
+write.csv(total_pm25_data_stations_city,
+          here("2025_report", 
+               "2025_PM25_no_of_stations_in_city_total_ncap.csv"), 
+               row.names = F)
+total_pm25_data_stations_state <- hourly_all %>%
+  filter(parameter == pm25) %>%
+  ungroup() %>%
+  group_by(state_name) %>%
+  summarise(n_stations = n_distinct(location_name))
+View(total_pm25_data_stations_city)
+write.csv(total_pm25_data_stations_state,
+          here("2025_report", 
+               "2025_PM25_no_of_stations_in_state_total_ncap.csv"), row.names = F)
+```
+
+
+## Table 3
+
+- 2025_PM_data_available_each_year.csv
+
+```{r}
+pollution_data_path <- here("data/CPCB/Pollutant")
+pollution_data_list <- list.files(pollution_data_path, full.names = TRUE) # full.names gives full file paths
+pollution_data <- data.frame()
+
+## looping through pollutant file system to read individual files and binding them together if the table is not empty
+## renaming the maximum_value_in_hour as max and average_value_in_hour as average
+## pivoting the data to have pollutant average and max values in different columns
+for (i in pollution_data_list) {
+  pollution_file <- read_csv(i)
+  if(nrow(pollution_file) > 0) {
+    pollution_file <- pollution_file %>%
+      dplyr::select(everything(), "average" = average_value_in_hour,
+                    "max" = maximum_value_in_hour, - c(state_code)) %>%
+      mutate(across(c(average, max), ~ as.numeric(as.character(.)))) %>%
+      pivot_wider(id_cols = c(observation_hour_start, location_name,
+                              city_name, district_name, state_name, district_code),
+                  names_from = parameter, values_from = c(average, max)) %>%
+      mutate(date_time = force_tz(as.POSIXct(observation_hour_start), tzone = tz_India),
+             year = year(date_time))
+    pollution_data <- rbind(setDT(pollution_data), setDT(pollution_file), fill = T)
+  }
+}
+
+pollution_data <- pollution_data %>%
+  mutate(
+    month = month(date_time),
+    season_req = case_when(
+      month %in% c(1, 2) ~ "Winter",
+      month %in% c(3, 4, 5) ~ "Pre-Monsoon",
+      month %in% c(6, 7, 8, 9) ~ "Southwest-Monsoon",
+      month %in% c(10, 11, 12) ~ "Post-Monsoon"
+    )
+  ) %>%
+  select(-month)
+
+# pollution_data <- readRDS("2025_pollutant_data.rds")
+
+pm25_annual_completeness <- read_csv(here("data/2025_PM25_annual_complete_data_station_info.csv"))
+pm10_annual_completeness <- read_csv(here("data/2025_PM10_annual_complete_data_station_info.csv"))
+
+key_full <- c("location_name", "state_name", "city_name", "year")
+
+pollution_pm25_data <- pollution_data %>%
+  dplyr::select(date_time, year, season_req, location_name, 
+                district_name, district_code, city_name,
+                state_name, average_PM25) %>%
+  left_join(pm25_annual_completeness, ., by = key_full)
+saveRDS(pollution_pm25_data, here("data/05-11-2025 Report files", 
+                                  "2025_PM25_pollutant_data.rds"))
+
+pollution_pm10_data <- pollution_data %>%
+  dplyr::select(date_time, year, season_req, location_name, 
+                district_name, district_code, city_name,
+                state_name, average_PM10) %>%
+  left_join(pm10_annual_completeness, ., by = key_full)
+saveRDS(pollution_pm10_data, 
+        here("data/05-11-2025 Report files", "2025_PM10_pollutant_data.rds"))
+
+pollution_data_station_info <- pollution_data %>%
+  dplyr::select(location_name, district_name, district_code,
+                city_name, state_name) %>%
+  distinct(across(everything()))
+
+group_avg <- c("location_name")
+
+pollution_daily <- timeAverage(pollution_data %>%
+                                 dplyr::select("date" = date_time, everything()) %>%
+                                 mutate(year = year(date)),
+                               avg.time = "day",
+                               type = group_avg)
+
+pollution_daily <- pollution_daily %>%
+  left_join(., pollution_data_station_info, by = c("location_name")) %>%
+  mutate(year = year(date)) %>%
+  mutate(
+    month = month(date),
+    season_req = case_when(
+      month %in% c(1, 2) ~ "Winter",
+      month %in% c(3, 4, 5) ~ "Pre-Monsoon",
+      month %in% c(6, 7, 8, 9) ~ "Southwest-Monsoon",
+      month %in% c(10, 11, 12) ~ "Post-Monsoon"
+    )
+  ) %>%
+  select(-month)
+saveRDS(pollution_daily, 
+        here("data/05-11-2025 Report files", "2025_PM_daily_data.rds"))
+
+# group_avg <- c("location_name", "district_name", "city_name", "state_name", "district_code", "season_req")
+
+# saveRDS(pollution_data_daily, "2025_PM_daily_data.rds")
+
+start_date <- as.Date("2017-01-01")
+end_date <- as.Date("2024-12-31")
+day_gap <- "1 day"
+date_all <- data.frame(date = seq(from = start_date,
+                                  to = end_date,
+                                  by = day_gap)) %>%
+  mutate(year = year(date))
+
+date_all_summ <- date_all %>%
+  group_by(year) %>%
+  summarise(total_days_each_year = sum(!is.na(date)))
+
+pollution_data_daily_summ <- pollution_daily %>%
+  select(date, year, location_name, city_name, district_name, district_code, state_name,
+         "PM10" = average_PM10, "PM25" = average_PM25) %>%
+  mutate(across(c(PM10, PM25),
+                ~ as.numeric(as.character(.)))) %>%
+  group_by(year, location_name, city_name, district_name, district_code, state_name) %>%
+  summarise(across(c(PM10, PM25),
+                   ~ sum(!is.na(.)))) %>%
+  left_join(., date_all_summ, by = c("year")) %>%
+  group_by(location_name, state_name, year) %>%
+  summarise(across(c(PM10, PM25),
+                   ~ round((. / total_days_each_year) * 100, digits = 2),
+                   .names = "non_NA_days_percent_{.col}"))
+write.csv(pollution_data_daily_summ, 
+          here("2025_report", "2025_PM_data_available_each_year.csv"),
+          row.names = F)
+
+```
+
+
+## Table 4: 
+
+Desc_order_2024_PM10.csv and Desc_order_2024_PM25.csv
+
+```{r}
+# hourly_pm25 <- hourly_all %>%
+#   filter(parameter == pm25) %>%
+#   mutate(year = year(observation_hour_start)) %>%
+#   group_by(year) %>%
+#   summarise(n_stations = n_distinct(location_name))
+# hourly_pm10 <- hourly_all %>%
+#   filter(parameter == pm10) %>%
+#   mutate(year = year(observation_hour_start)) %>%
+#   group_by(year) %>%
+#   summarise(n_stations = n_distinct(location_name))
+daily_all <- readRDS(
+  here("data/05-11-2025 Report files", 
+       "2025_04_12_HEI_daily_data_completeness.rds")) %>%
+  filter(!str_starts(location_name, "US Diplomatic Post:")) %>%
+  filter(city_name %in% unique(ncap_list$City_name))
+
+daily_pm25_data <- daily_all %>%
+  filter(day_completeness == yes) %>%
+  filter(parameter == pm25)
+saveRDS(daily_pm25_data, 
+        here("data/05-11-2025 Report files", 
+             "2025_PM25_daily_data_completeness.rds"))
+
+daily_pm25_data <- readRDS(here("data/05-11-2025 Report files",
+                                "2025_PM25_daily_data_completeness.rds")) %>%
+  filter(!str_starts(location_name, "US Diplomatic Post:")) %>%
+  filter(city_name %in% unique(ncap_list$City_name))
+
+daily_pm25 <- daily_pm25_data %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name))
+
+daily_pm10_data <- daily_all %>%
+  filter(day_completeness == yes) %>%
+  filter(parameter == pm10)
+saveRDS(daily_pm10_data, 
+        here("data/05-11-2025 Report files", "2025_PM10_daily_data_completeness.rds"))
+
+daily_pm10_data <- readRDS(here("data/05-11-2025 Report files", 
+                                "2025_PM10_daily_data_completeness.rds")) %>%
+  filter(!str_starts(location_name, "US Diplomatic Post:")) %>%
+  filter(city_name %in% unique(ncap_list$City_name))
+
+daily_pm10 <- daily_pm10_data %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name))
+
+loc_name <- c("year", "location_name")
+
+# stations removed in PM2.5 for daily filter
+unique_locations_hourly_pm25 <- hourly_all %>% filter(parameter == pm25) %>% mutate(year = year(date)) %>%
+  ungroup() %>%
+  distinct(year, location_name)
+unique_locations_daily_pm25 <- daily_pm25_data %>%
+  ungroup() %>%
+  distinct(year, location_name)
+locations_only_in_hourly_by_year_pm25 <- unique_locations_hourly_pm25 %>%
+  anti_join(unique_locations_daily_pm25, by = loc_name)
+write.csv(locations_only_in_hourly_by_year_pm25,
+          here("2025_report", 
+               "2025_PM25_stations_removed_by_year_due_to_daily_comp_criteria.csv"), 
+          row.names = F)
+
+## stations removed in PM10 for daily filter
+unique_locations_hourly_pm10 <- hourly_all %>% filter(parameter == pm10) %>% mutate(year = year(date)) %>%
+  ungroup() %>%
+  distinct(year, location_name)
+unique_locations_daily_pm10 <- daily_pm10_data %>%
+  ungroup() %>%
+  distinct(year, location_name)
+locations_only_in_hourly_by_year_pm10 <- unique_locations_hourly_pm10 %>%
+  anti_join(unique_locations_daily_pm10, by = loc_name)
+write.csv(locations_only_in_hourly_by_year_pm10,
+          here("2025_report", "2025_PM10_stations_removed_by_year_due_to_daily_comp_criteria.csv"),
+          row.names = F)
+
+
+monthly_pm25_data <- daily_all %>%
+  filter(parameter %in% pm25) %>%
+  group_by(state_name, city_name, location_name, file_name, year, month, parameter) %>%
+  summarise(days_available = n_distinct(date),
+            month_completeness = ifelse(days_available >= threshold_days, yes, no),
+            month_average = ifelse(days_available >= threshold_days, mean(day_average, na.rm = T), NA)) %>%
+  filter(month_completeness == yes)
+saveRDS(monthly_pm25_data, 
+        here("data/05-11-2025 Report files", "2025_PM25_monthly_data_completeness.rds"))
+
+monthly_pm25_data_Varanasi <- hourly_all %>%
+  filter(parameter %in% pm25) %>%
+  filter(city_name == "Patancheru")
+
+monthly_pm10_data <- daily_all %>%
+  filter(parameter %in% pm10) %>%
+  group_by(state_name, city_name, location_name, file_name, year, month, parameter) %>%
+  summarise(days_available = n_distinct(date),
+            month_completeness = ifelse(days_available >= threshold_days, yes, no),
+            month_average = ifelse(days_available >= threshold_days, mean(day_average, na.rm = T), NA)) %>%
+  filter(month_completeness == yes)
+saveRDS(monthly_pm10_data, 
+        here("data/05-11-2025 Report files", "2025_PM10_monthly_data_completeness.rds"))
+
+monthly_pm25 <- daily_all %>%
+  filter(parameter %in% pm25) %>%
+  group_by(state_name, city_name, location_name, file_name, year, month, parameter) %>%
+  summarise(days_available = n_distinct(date),
+            month_completeness = ifelse(days_available >= threshold_days, yes, no),
+            month_average = ifelse(days_available >= threshold_days, mean(day_average, na.rm = T), NA)) %>%
+  filter(month_completeness == yes) %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name))
+
+monthly_pm10 <- daily_all %>%
+  filter(parameter %in% pm10) %>%
+  group_by(state_name, city_name, location_name, file_name, year, month, parameter) %>%
+  summarise(days_available = n_distinct(date),
+            month_completeness = ifelse(days_available >= threshold_days, yes, no),
+            month_average = ifelse(days_available >= threshold_days, mean(day_average, na.rm = T), NA)) %>%
+  filter(month_completeness == yes) %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name))
+
+
+## stations removed in PM2.5 for monthly filter
+unique_locations_monthly_pm25 <- monthly_pm25_data %>%
+  ungroup() %>%
+  distinct(year, location_name)
+locations_only_in_daily_by_year_pm25 <- unique_locations_daily_pm25 %>%
+  anti_join(unique_locations_monthly_pm25, by = loc_name)
+write.csv(locations_only_in_daily_by_year_pm25,
+          here("2025_report", 
+               "2025_PM25_stations_removed_by_year_due_to_monthly_comp_criteria.csv"), 
+          row.names = F)
+
+## stations removed in PM10 for monthly filter
+unique_locations_monthly_pm10 <- monthly_pm10_data %>%
+  ungroup() %>%
+  distinct(year, location_name)
+locations_only_in_daily_by_year_pm10 <- unique_locations_daily_pm10 %>%
+  anti_join(unique_locations_monthly_pm10, by = loc_name)
+write.csv(locations_only_in_daily_by_year_pm10,
+          here("2025_report", 
+               "2025_PM10_stations_removed_by_year_due_to_monthly_comp_criteria.csv"), 
+          row.names = F)
+
+yearly_pm25_data <- monthly_pm25_data %>%
+  group_by(state_name, city_name, location_name, file_name, year, parameter) %>%
+  summarise(months_available = n_distinct(month),  # Count days with completeness "Yes"
+            year_completeness = ifelse(months_available >= threshold_months, yes, no),
+            year_average = ifelse(months_available >= threshold_months, mean(month_average, na.rm = T), NA)) %>%
+  filter(year_completeness == yes) %>%
+  mutate(annual_limit = 40)
+saveRDS(yearly_pm25_data, 
+        here("data/05-11-2025 Report files", "2025_PM25_yearly_data_completeness.rds"))
+
+
+yearly_pm10_data <- monthly_pm10_data %>%
+  group_by(state_name, city_name, location_name, file_name, year, parameter) %>%
+  summarise(months_available = n_distinct(month),  # Count days with completeness "Yes"
+            year_completeness = ifelse(months_available >= threshold_months, yes, no),
+            year_average = ifelse(months_available >= threshold_months, mean(month_average, na.rm = T), NA)) %>%
+  filter(year_completeness == yes) %>%
+  mutate(annual_limit = 60)
+saveRDS(yearly_pm10_data, here("data/05-11-2025 Report files", 
+                               "2025_PM10_yearly_data_completeness.rds"))
+
+yearly_pm25_data <- readRDS(here("data/05-11-2025 Report files",
+                                 "2025_PM25_yearly_data_completeness.rds")) %>%
+  filter(city_name %in% unique(ncap_list$City_name))
+
+yearly_pm25_2024 <- yearly_pm25_data %>%
+  filter(year == 2024) %>%
+  arrange(desc(year_average))
+write.csv(yearly_pm25_2024, 
+          here("2025_report", "Desc_order_2024_PM25.csv"), row.names = F)
+
+yearly_pm10_data <- readRDS(here("data/05-11-2025 Report files",
+                                 "2025_PM10_yearly_data_completeness.rds")) %>%
+  filter(city_name %in% unique(ncap_list$City_name))
+yearly_pm10_2024 <- yearly_pm10_data %>%
+  filter(year == 2024) %>%
+  arrange(desc(year_average))
+write.csv(yearly_pm10_2024, 
+          here("2025_report", "Desc_order_2024_PM10.csv"), row.names = F)
+```
+
+
+
+### Table 5
+
+- 2025_PM25_yearly_change_station_wise_city_wise_annual_completeness_criteria.csv and 2025_PM10_yearly_change_station_wise_city_wise_annual_completeness_criteria.csv
+
+```{r}
+
+yearly_pm25_data <- readRDS(here("data/05-11-2025 Report files",
+                                 "2025_PM25_yearly_data_completeness.rds")) %>%
+  dplyr::select(year, city_name, state_name, year_average, everything()) %>%
+  ungroup() %>%
+  group_by(city_name, state_name, year) %>%
+  mutate(city_year_average = mean(year_average, na.rm = T)) %>%
+  arrange(city_name, state_name, year) %>%
+  group_by(city_name, state_name) %>%
+  mutate(city_annual_per_change = (city_year_average - lag(city_year_average)) /
+           lag(city_year_average) * 100,
+         city_annual_change = city_year_average - lag(city_year_average)) %>%
+  ungroup() %>%
+  arrange(location_name, city_name, state_name, year) %>%
+  group_by(location_name, city_name, state_name) %>%
+  mutate(station_annual_per_change = (year_average - lag(year_average)) /
+           lag(year_average) * 100,
+         station_annual_change = year_average - lag(year_average))
+write.csv(yearly_pm25_data,
+          here("2025_report", 
+               "2025_PM25_yearly_change_station_wise_city_wise_annual_completeness_criteria.csv"), 
+          row.names = F)
+
+
+## yearly change for location_name and city_name in PM10 for yearly complete data
+yearly_pm10_data <- readRDS(here("data/05-11-2025 Report files",
+                                 "2025_PM10_yearly_data_completeness.rds"))  %>%
+  dplyr::select(year, city_name, state_name, year_average, everything()) %>%
+  ungroup() %>%
+  group_by(city_name, state_name, year) %>%
+  mutate(city_year_average = mean(year_average, na.rm = T)) %>%
+  arrange(city_name, state_name, year) %>%
+  group_by(city_name, state_name) %>%
+  mutate(city_annual_per_change = (city_year_average - lag(city_year_average)) /
+           lag(city_year_average) * 100,
+         city_annual_change = city_year_average - lag(city_year_average)) %>%
+  ungroup() %>%
+  arrange(location_name, city_name, state_name, year) %>%
+  group_by(location_name, city_name, state_name) %>%
+  mutate(station_annual_per_change = (year_average - lag(year_average)) /
+           lag(year_average) * 100,
+         station_annual_change = year_average - lag(year_average))
+write.csv(yearly_pm10_data, 
+          here("2025_report", 
+               "2025_PM10_yearly_change_station_wise_city_wise_annual_completeness_criteria.csv"), 
+          row.names = F)
+
+```
+
+2025_PM10_rolling_avg_annual_completeness_ncap.csv Filtered stations with more than 5 years of data.
+
+
+```{r}
+monthly_pm25 <- daily_all %>%
+  filter(parameter %in% pm25) %>%
+  group_by(state_name, city_name, location_name, file_name, year, month, parameter) %>%
+  summarise(days_available = n_distinct(date),
+            month_completeness = ifelse(days_available >= threshold_days, yes, no),
+            month_average = ifelse(days_available >= threshold_days, mean(day_average, na.rm = T), NA)) %>%
+  filter(city_name %in% unique(ncap_list$City_name)) %>%
+  filter(month_completeness == yes) %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name))
+
+monthly_pm10 <- daily_all %>%
+  filter(parameter %in% pm10) %>%
+  group_by(state_name, city_name, location_name, file_name, year, month, parameter) %>%
+  summarise(days_available = n_distinct(date),
+            month_completeness = ifelse(days_available >= threshold_days, yes, no),
+            month_average = ifelse(days_available >= threshold_days, mean(day_average, na.rm = T), NA)) %>%
+  filter(city_name %in% unique(ncap_list$City_name)) %>%
+  filter(month_completeness == yes) %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name))
+
+
+yearly_pm25 <- monthly_pm25_data %>%
+  group_by(state_name, city_name, location_name, file_name, year, parameter) %>%
+  summarise(months_available = n_distinct(month),  # Count days with completeness "Yes"
+            year_completeness = ifelse(months_available >= threshold_months, yes, no),
+            year_average = ifelse(months_available >= threshold_months, mean(month_average, na.rm = T), NA)) %>%
+  filter(year_completeness == yes) %>%
+  filter(city_name %in% unique(ncap_list$City_name)) %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name))
+
+yearly_pm10 <- monthly_pm10_data %>%
+  group_by(state_name, city_name, location_name, file_name, year, parameter) %>%
+  summarise(months_available = n_distinct(month),  # Count days with completeness "Yes"
+            year_completeness = ifelse(months_available >= threshold_months, yes, no),
+            year_average = ifelse(months_available >= threshold_months, mean(month_average, na.rm = T), NA)) %>%
+  filter(year_completeness == yes) %>%
+  filter(city_name %in% unique(ncap_list$City_name)) %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name))
+
+window <- 2
+pollutant_name <- "year_average"
+new_name_suffix2 <- "_3_yr_roll_avg"
+new_name_suffix <- "_2_yr_roll_avg"
+alignment <- "right"
+yearly_pm25_data <- yearly_pm25_data %>%
+  arrange(location_name, year) %>%
+  group_by(location_name) %>%
+  mutate(!!paste0(pollutant_name, new_name_suffix) := rollapply(get(pollutant_name),
+                                                                width = window,
+                                                                FUN = function(x) {
+                                                                  if (sum(!is.na(x)) == window) {
+                                                                    mean(x, na.rm = TRUE)
+                                                                  } else {
+                                                                    NaN
+                                                                  }
+                                                                },
+                                                                fill = NA,
+                                                                align = alignment)) %>%
+  ungroup() %>%
+  group_by(location_name) %>%
+  mutate(!!paste0(pollutant_name, new_name_suffix2) := rollapply(get(pollutant_name),
+                                                                width = 3,
+                                                                FUN = function(x) {
+                                                                  if (sum(!is.na(x)) == 3) {
+                                                                    mean(x, na.rm = TRUE)
+                                                                  } else {
+                                                                    NaN
+                                                                  }
+                                                                },
+                                                                fill = NA,
+                                                                align = alignment)) %>%
+  ungroup()
+
+
+yearly_pm10_data <- yearly_pm10_data %>%
+  arrange(location_name, year) %>%
+  group_by(location_name) %>%
+  mutate(!!paste0(pollutant_name, new_name_suffix) := rollapply(get(pollutant_name),
+                                                                width = window,
+                                                                FUN = function(x) {
+                                                                  if (sum(!is.na(x)) == window) {
+                                                                    mean(x, na.rm = TRUE)
+                                                                  } else {
+                                                                    NaN
+                                                                  }
+                                                                },
+                                                                fill = NA,
+                                                                align = alignment)) %>%
+  ungroup() %>%
+  group_by(location_name) %>%
+  mutate(!!paste0(pollutant_name, new_name_suffix2) := rollapply(get(pollutant_name),
+                                                                 width = 3,
+                                                                 FUN = function(x) {
+                                                                   if (sum(!is.na(x)) == 3) {
+                                                                     mean(x, na.rm = TRUE)
+                                                                   } else {
+                                                                     NaN
+                                                                   }
+                                                                 },
+                                                                 fill = NA,
+                                                                 align = alignment)) %>%
+  ungroup()
+
+
+
+yearly_pm10_data <- yearly_pm10_data %>%
+  group_by(location_name, city_name, state_name) %>%
+  arrange(year, .by_group = TRUE) %>%
+  # fill(year_average_3_yr_roll_avg, .direction = "up") %>%
+  mutate(above_roll_avg = year_average > year_average_3_yr_roll_avg) %>%
+  ungroup()
+write.csv(yearly_pm10_data,
+          here("2025_report", 
+               "2025_PM10_rolling_avg_annual_completeness_ncap.csv"), 
+          row.names = F)
+yearly_pm25_data <- yearly_pm25_data %>%
+  group_by(location_name, city_name, state_name) %>%
+  arrange(year, .by_group = TRUE) %>%
+  # fill(year_average_3_yr_roll_avg, .direction = "up") %>%
+  mutate(above_roll_avg = year_average > year_average_3_yr_roll_avg) %>%
+  ungroup()
+write.csv(yearly_pm25_data, 
+          here("2025_report", 
+               "2025_PM25_rolling_avg_annual_completeness_ncap.csv"),
+          row.names = F)
+
+```
+
+
+
+## plots 
+
+```{r}
+year_colors <- c(
+  "2017" = "#E69F00", # Orange
+  "2018" = "#56B4E9", # Sky Blue
+  "2019" = "#009E73", # Bluish Green
+  "2020" = "#F0E442", # Yellow
+  "2021" = "#0072B2", # Blue
+  "2022" = "#D55E00", # Vermillion
+  "2023" = "#CC79A7", # Reddish Purple
+  "2024" = "#999999"  # Gray
+)
+
+theme_HEI <- list(theme(legend.text = element_text(size = 14),
+                        legend.title = element_blank(),
+                        legend.position = "none",
+                        strip.text = element_text(size = 14, face = "bold", colour = "black"),
+                        plot.title = element_text(size = 18, face = "bold", colour = "black"),
+                        axis.title = element_text(size = 18, colour = "black"),
+                        axis.text = element_text(size = 16, colour = "black", face = "bold"),
+                        panel.border = element_rect(colour = "black", fill = NA, size = 1)))
+
+group_avg <- c("location_name", "district_name", "city_name", "state_name", "district_code")
+pollution_data <- pollution_data %>%
+  dplyr::select("date" = date_time, everything())
+
+pollution_data_ncap <- pollution_data %>%
+  filter(!str_starts(location_name, "US Diplomatic Post:")) %>%
+  filter(city_name %in% unique(ncap_list$City_name)) %>%
+  mutate(year = year(date),
+         pm2.5_g_pm10 = ifelse(average_PM25 > average_PM10, "Check PM2.5 values", NA))
+
+## Basic trend analysis using a line plot using daily data
+pollution_data_ncap_daily <- timeAverage(pollution_data_ncap,
+                                         avg.time = "day",
+                                         type = group_avg)
+
+# Alandur Bus Depot, Chennai - CPCB
+# Jai Bhim Nagar, Meerut - UPPCB
+# Deonar, Mumbai - IITM
+# Alandi, Pune - IITM
+# "Manali Village, Chennai - TNPCB"
+# Peenya, Bengaluru - CPCB
+# MIDC Khutala, Chandrapur - MPCB
+# MIT-Kothrud, Pune - IITM
+i <- "MIT-Kothrud, Pune - IITM"
+year_s <- c(2021)
+
+wid <- 8
+hei <- 6
+k_all <- c("PM10", "PM25")
+## loop over each NCAP station
+for(i in unique(pollution_data_ncap_daily$location_name)) {
+  ## select the date and pollutant information using the daily average data calculated above
+  pollution_data_ncap_ba <- pollution_data_ncap_daily %>%
+    select(date, location_name, state_name, year, average_PM10, average_PM25,
+           average_CO, average_NO2, average_SO2, average_O3) %>%
+    filter(location_name == i) %>%
+    mutate(year = year(date),
+           month = month(date)) %>%
+    pivot_longer(-c(date, location_name, state_name, year, month), values_to = "values", names_to = "parameter") %>%
+    mutate(parameter = gsub("average_", "", parameter),
+           date = update(date, year = 1970))
+  ## loop over each parameter for the station
+  for(k in k_all) {
+    ## Plot date on x axis and pollutant on y axis
+    plot_BT <- ggplot(data = subset(pollution_data_ncap_ba, parameter == k),
+                      aes(x = as.Date(date), y = values, color = as.factor(year))) +
+      geom_line(size = 0.75) + scale_y_continuous(limits = c(0, NA)) +
+      ## Add appropriate title
+      labs(y = expression(PM[2.5] ~ mu * gm^-3), x = "", title = paste(unique(pollution_data_ncap_ba$state_name), ":",
+                                         unique(pollution_data_ncap_ba$location_name))) +
+      theme_classic() + theme_HEI + theme(legend.position = "right") +
+      scale_x_date(date_labels = "%b", date_breaks = "2 months") + scale_color_manual(values = year_colors)
+    ## save the plot in jpeg format
+    ggsave(filename = here::here("2025_report", 
+                                 paste0(gsub("-", "_",
+                                             as.Date(now())), 
+                                        "_", i, "_", k,
+                                        "_BT.pdf")),
+           plot = plot_BT, 
+           width = wid, 
+           height = hei, 
+           dpi = 350)
+  }
+}
+
+
+wid <- 12
+hei <- 8
+
+for(i in unique(pollution_data_ncap_daily$location_name)) {
+  ## select the date and pollutant information using the daily average data calculated above
+  pollution_data_ncap_ba <- pollution_data_ncap_daily %>%
+    select(date, location_name, state_name, year, average_PM10, average_PM25,
+           average_CO, average_NO2, average_SO2, average_O3) %>%
+    filter(location_name == i) %>%
+    mutate(year = year(date),
+           month = month(date)) %>%
+    pivot_longer(-c(date, location_name, state_name, year, month), values_to = "values", names_to = "parameter") %>%
+    mutate(parameter = gsub("average_", "", parameter),
+           date = update(date, year = 1970)) 
+  ## loop over each parameter for the station
+  for(k in k_all) {
+    ## Plot date on x axis and pollutant on y axis
+    plot_BT <- ggplot(data = subset(pollution_data_ncap_ba, parameter == k),
+                      aes(x = as.Date(date), y = values, color = as.factor(year))) +
+      geom_line(size = 1.25) + facet_grid(rows = vars(year)) + scale_y_continuous(limits = c(0, NA)) +
+      ## Add appropriate title
+      labs(y = expression(PM[10] ~ mu * gm^-3), x = "", title = paste(unique(pollution_data_ncap_ba$state_name), ":",
+                                                                       unique(pollution_data_ncap_ba$location_name))) +
+      theme_classic() + theme_HEI + theme(legend.position = "None") +
+      scale_x_date(date_labels = "%b", date_breaks = "2 months") + scale_color_manual(values = year_colors)
+    ## save the plot in jpeg format
+    ggsave(filename = here::here("2025_report", paste0(gsub("-", "_", as.Date(now())), "_", i, "_", k, "_BT_facet.pdf")),
+           plot = plot_BT, width = wid, height = hei, dpi = 350)
+  }
+}
+```
+
+
+```{r}
+pm25_naaqs_threshold_annual <- 40
+pm10_naaqs_threshold_annual <- 60
+
+pollution_data_daily <- readRDS(here("data/05-11-2025 report files", "2025_PM_daily_data.rds"))
+
+monthly_summary_pm25 <- pollution_data_daily %>%
+  group_by(year, location_name, city_name, state_name, district_name,
+           district_code, month = month(date)) %>%
+  summarise(
+    monthly_mean_PM25 = mean(average_PM25, na.rm = T),
+    monthly_median_PM25 = median(average_PM25, na.rm = T),
+    monthly_sd_PM25 = sd(average_PM25, na.rm = T)
+  ) %>%
+  ungroup()
+# write.csv(monthly_summary_pm25, "2025_PM25_monthly_summary_using_daily_values.csv", row.names = F)
+
+
+monthly_summary_pm10 <- pollution_data_daily %>%
+  group_by(year, location_name, city_name, state_name, district_name,
+           district_code, month = month(date)) %>%
+  summarise(
+    monthly_mean_PM10 = mean(average_PM10, na.rm = T),
+    monthly_median_PM10 = median(average_PM10, na.rm = T),
+    monthly_sd_PM10 = sd(average_PM10, na.rm = T)
+  ) %>%
+  ungroup()
+# write.csv(monthly_summary_pm10, "2025_PM10_monthly_summary_using_daily_values.csv", row.names = F)
+
+
+monthly_summary_pm25_annual <- monthly_summary_pm25 %>%
+  left_join(pm25_annual_completeness, ., by = key_full)
+
+monthly_summary_pm10_annual <- monthly_summary_pm10 %>%
+  left_join(pm10_annual_completeness, ., by = key_full)
+
+year_colors <- c(
+  "2017" = "#E69F00",
+  "2018" = "#56B4E9",
+  "2019" = "#009E73",
+  "2020" = "#F0E442",
+  "2021" = "#0072B2",
+  "2022" = "#D55E00",
+  "2023" = "#CC79A7",
+  "2024" = "purple"
+)
+
+for(i in unique(monthly_summary_pm25_annual$location_name)) {
+  pollution_pm25_daily_sub <- monthly_summary_pm25_annual %>%
+    filter(location_name == i) %>%
+    mutate(month = factor(month.abb[month], levels = month.abb)) %>%
+    filter(!is.na(year))
+  plot_BT <- ggplot(data = pollution_pm25_daily_sub,
+                    aes(x = month, y = monthly_mean_PM25, color = as.factor(year))) +
+    geom_hline(yintercept = pm25_naaqs_threshold_annual, color = "grey70", size = 0.75) +
+    geom_line(aes(group = year), size = 0.75) +
+    geom_point(aes(group = year), size = 2) +
+    labs(y = expression(paste(PM[2.5], "(", mu, "g", ~m^{-3}, ")")), x = NULL,
+         title = i) + scale_y_continuous(limits = c(0, NA)) +
+    theme_classic() + theme_HEI + theme(legend.position = "right") +
+    scale_color_manual(values = year_colors)
+  ## save the plot in jpeg format
+  ggsave(filename = here::here("2025_report", 
+                               paste0(gsub("-", "_",
+                                           as.Date(now())),
+                                      "_PM25_", i,
+                                      "_monthly_BT.pdf")),
+         plot = plot_BT, width = 8, height = 6)
+}
+
+
+for(i in unique(monthly_summary_pm10_annual$location_name)) {
+  pollution_pm10_daily_sub <- monthly_summary_pm10_annual %>%
+    filter(location_name == i) %>%
+    mutate(month = factor(month.abb[month], levels = month.abb)) %>%
+    filter(!is.na(year))
+  plot_BT <- ggplot(data = pollution_pm10_daily_sub,
+                    aes(x = month, y = monthly_mean_PM10, color = as.factor(year))) +
+    geom_hline(yintercept = pm10_naaqs_threshold_annual, color = "grey70", size = 0.75) +
+    geom_line(aes(group = year), size = 0.75) +
+    geom_point(aes(group = year), size = 2) +
+    labs(y = expression(paste(PM[10], "(", mu, "g", ~m^{-3}, ")")), x = NULL,
+         title = i) + scale_y_continuous(limits = c(0, NA)) +
+    theme_classic() + theme_HEI + theme(legend.position = "right") +
+    scale_color_manual(values = year_colors)
+  ## save the plot in jpeg format
+  ggsave(filename = here::here("2025_report", paste0(gsub("-", "_", as.Date(now())), "_PM10_", i, "_monthly_BT.pdf")),
+         plot = plot_BT, width = 8, height = 6)
+}
+
+```
+
+
+```{r}
+f <- function(x) {
+  r <- quantile(x, probs = c(0.05, 0.25, 0.5, 0.75, 0.95))
+  names(r) <- c("ymin", "lower", "middle", "upper", "ymax")
+  r
+}
+
+year_colors <- c(
+  "2017" = "#E69F00",
+  "2018" = "#56B4E9",
+  "2019" = "#009E73",
+  "2020" = "#F0E442",
+  "2021" = "#0072B2",
+  "2022" = "#D55E00",
+  "2023" = "#CC79A7",
+  "2024" = "purple"
+)
+theme_HEI <- list(theme(legend.text = element_text(size = 12),
+                        legend.title = element_blank(),
+                        legend.position = "none",
+                        strip.text = element_text(size = 12, face = "bold", colour = "black"),
+                        plot.title = element_text(size = 16, face = "bold", colour = "black"),
+                        axis.title = element_text(size = 15, colour = "black"),
+                        axis.text = element_text(size = 15, colour = "black", face = "bold"),
+                        panel.border = element_rect(colour = "black", fill = NA, size = 1)))
+
+pm10_annual_naaqs_threshold <- 60
+pm25_annual_naaqs_threshold <- 40
+
+wid <- 7
+hei <- 5
+
+wid1 <- 10
+hei1 <- 6
+
+pollution_pm10 <- readRDS(here("data/05-11-2025 Report files", "2025_PM10_yearly_data_completeness.rds")) %>%
+  filter(city_name %in% unique(ncap_list$City_name))
+
+ggplot(data = pollution_pm10, aes(x = year, y = year_average,
+                                               fill = as.factor(year))) +
+  labs(x = NULL, y = expression(paste(PM[10], "(", mu, "g", ~m^{-3}, ")")), title = NULL) +
+  geom_hline(yintercept = pm10_annual_naaqs_threshold, linetype = "dashed",
+             color = "grey30", linewidth = 1) +
+  annotate("text", x = 2025, y = pm10_annual_naaqs_threshold - 10,
+           label = "NAAQS PM10 annual", hjust = 1, size = 4, color = "black") +
+  stat_summary(fun.data = f, geom = "boxplot", width = 0.5, size = 0.5,
+               color = "black") +
+  stat_summary(fun.y = mean, geom = "point", size = 1.3, colour = "black") +
+  scale_y_continuous(limits = c(0, 305), expand = c(0, 0), breaks = c(0, 50, 100, 150, 200, 250, 300)) +
+  scale_fill_manual(values = year_colors) +
+  theme_classic() + theme_HEI +
+  scale_x_continuous(limits = c(2016, 2025), breaks = c(2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024))
+ggsave(here::here("2025_report", paste0(year(now()), "_PM10_yearly_box_plot_annual_completeness_ncap.pdf")),
+       width = wid, height = hei)
+
+pollution_pm25 <- readRDS(here("data/05-11-2025 Report files", "2025_PM25_yearly_data_completeness.rds")) %>%
+  filter(city_name %in% unique(ncap_list$City_name))
+ggplot(data = pollution_pm25, aes(x = year, y = year_average,
+                                  fill = as.factor(year))) +
+  labs(x = NULL, y = expression(paste(PM[2.5], "(", mu, "g", ~m^{-3}, ")")), title = NULL) +
+  geom_hline(yintercept = pm25_annual_naaqs_threshold, linetype = "dashed",
+             color = "grey30", linewidth = 1) +
+  annotate("text", x = 2025, y = pm25_annual_naaqs_threshold - 10,
+           label = "NAAQS PM25 annual", hjust = 1, size = 4, color = "black") +
+  stat_summary(fun.data = f, geom = "boxplot", width = 0.5, size = 0.5,
+               color = "black") +
+  stat_summary(fun.y = mean, geom = "point", size = 1.3, colour = "black") +
+  scale_y_continuous(limits = c(0, 152), expand = c(0, 0), breaks = c(0, 50, 100, 150)) +
+  scale_fill_manual(values = year_colors) +
+  theme_classic() + theme_HEI +
+  scale_x_continuous(limits = c(2016, 2025), breaks = c(2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024))
+ggsave(here::here("2025_report", paste0(year(now()), "_PM25_yearly_box_plot_annual_completeness_ncap.pdf")),
+       width = wid, height = hei)
+
+
+## 3 or more years
+file_pm10 <- read.csv(here("2025_report", "Number of stations & cities that meet annual completeness criteria for PM2.5 for more than 3 years.csv"))
+
+ggplot(data = pollution_pm10 %>%
+         filter(location_name %in% unique(file_pm10$location_name)), aes(x = year, y = year_average,
+                                  fill = as.factor(year))) +
+  labs(x = NULL, y = expression(paste(PM[10], "(", mu, "g", ~m^{-3}, ")")), title = NULL) +
+  geom_hline(yintercept = pm10_annual_naaqs_threshold, linetype = "dashed",
+             color = "grey30", linewidth = 1) +
+  annotate("text", x = 2025, y = pm10_annual_naaqs_threshold - 10,
+           label = "NAAQS PM10 annual", hjust = 1, size = 4, color = "black") +
+  stat_summary(fun.data = f, geom = "boxplot", width = 0.5, size = 0.5,
+               color = "black") +
+  stat_summary(fun.y = mean, geom = "point", size = 1.3, colour = "black") +
+  scale_y_continuous(limits = c(0, 305), expand = c(0, 0), breaks = c(0, 50, 100, 150, 200, 250, 300)) +
+  scale_fill_manual(values = year_colors) +
+  theme_classic() + theme_HEI +
+  scale_x_continuous(limits = c(2016, 2025), breaks = c(2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024))
+ggsave(here::here("2025_report", paste0(year(now()), "_PM10_yearly_box_plot_annual_completeness_stations_with_3_years_ncap.pdf")),
+       width = wid, height = hei)
+
+file_pm25 <- read.csv(here("2025_report", "Number of stations & cities that meet annual completeness criteria for PM2.5 for more than 3 years.csv"))
+
+ggplot(data = pollution_pm25 %>%
+         filter(location_name %in% unique(file_pm25$location_name)), aes(x = year, y = year_average,
+                                  fill = as.factor(year))) +
+  labs(x = NULL, y = expression(paste(PM[2.5], "(", mu, "g", ~m^{-3}, ")")), title = NULL) +
+  geom_hline(yintercept = pm25_annual_naaqs_threshold, linetype = "dashed",
+             color = "grey30", linewidth = 1) +
+  annotate("text", x = 2025, y = pm25_annual_naaqs_threshold - 10,
+           label = "NAAQS PM25 annual", hjust = 1, size = 4, color = "black") +
+  stat_summary(fun.data = f, geom = "boxplot", width = 0.5, size = 0.5,
+               color = "black") +
+  stat_summary(fun.y = mean, geom = "point", size = 1.3, colour = "black") +
+  scale_y_continuous(limits = c(0, 152), expand = c(0, 0), breaks = c(0, 50, 100, 150)) +
+  scale_fill_manual(values = year_colors) +
+  theme_classic() + theme_HEI +
+  scale_x_continuous(limits = c(2016, 2025), breaks = c(2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024))
+ggsave(here::here("2025_report", paste0(year(now()), "_PM25_yearly_box_plot_annual_completeness_stations_with_3_years_ncap.pdf")),
+       width = wid, height = hei)
+
+```
+
+
+```{r}
+
+# Define variables for filtering
+format_dt <- "%Y-%m-%d %H:%M:%S"
+tz_asia <- "Asia/Kolkata"
+yes <- "Yes"
+no <- "No"
+
+## Define the thresholds for completeness
+threshold_hours <- 18
+threshold_days <- 23
+threshold_months <- 11
+naaqs_pm25_daily <- 60
+naaqs_pm10_daily <- 100
+
+## Define timezone
+tz_India <- "Asia/Kolkata"
+
+## Read paths in a clean way, List pollution files and defining a empty data frame to store the data
+pollution_data_path <- here("data/CPCB/Pollutant")
+
+## Read the NCAP list of stations
+ncap_list <- read_xlsx(here("data", "Clean sheet_10-05-2024.xlsx"), sheet = 2) %>%
+  mutate(City_name = ifelse(City_name == "Amaravati", "Amravati", City_name),
+         City_name = ifelse(City_name == "Dharwad", "Hubballi", City_name)) %>%
+  filter(!is.na(City_name)) %>%
+  filter(City_name != 0) %>%
+  distinct(City_name)
+
+
+hourly_all <- readRDS(here("data/05-11-2025 Report files", "2025_04_12_HEI_hourly_data.rds")) %>%
+  filter(!str_starts(location_name, "US Diplomatic Post:")) %>% 
+  filter(city_name %in% unique(ncap_list$City_name))
+# saveRDS(daily_all, here("data/05-11-2025 Report files", "2025_04_12_HEI_daily_data_completeness.rds"))
+
+pm25 <- c("PM25")
+pm10 <- c("PM10")
+hourly_pm25 <- hourly_all %>%
+  filter(parameter == pm25) %>%
+  mutate(year = year(observation_hour_start)) %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name))
+hourly_pm10 <- hourly_all %>%
+  filter(parameter == pm10) %>%
+  mutate(year = year(observation_hour_start)) %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name))
+daily_all <- readRDS(here("data/05-11-2025 Report files", "2025_04_12_HEI_daily_data_completeness.rds")) %>%
+  filter(!str_starts(location_name, "US Diplomatic Post:")) %>% 
+  filter(city_name %in% unique(ncap_list$City_name))
+# daily_pm25_data <- daily_all %>%
+#   filter(day_completeness == yes) %>%
+#   filter(parameter == pm25)
+# saveRDS(daily_pm25_data, here("data/05-11-2025 Report files", "2025_PM25_daily_data_completeness.rds"))
+daily_pm25_data <- readRDS(here("data/05-11-2025 Report files",  "2025_PM25_daily_data_completeness.rds")) %>%
+  filter(!str_starts(location_name, "US Diplomatic Post:")) %>% 
+  filter(city_name %in% unique(ncap_list$City_name))
+
+daily_pm25 <- daily_pm25_data %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name))
+
+# daily_pm10_data <- daily_all %>%
+#   filter(day_completeness == yes) %>%
+#   filter(parameter == pm10)
+# saveRDS(daily_pm10_data, here("data/05-11-2025 Report files", "2025_PM10_daily_data_completeness.rds"))
+daily_pm10_data <- readRDS(here("data/05-11-2025 Report files", "2025_PM10_daily_data_completeness.rds")) %>%
+  filter(!str_starts(location_name, "US Diplomatic Post:")) %>% 
+  filter(city_name %in% unique(ncap_list$City_name))
+
+daily_pm10 <- daily_pm10_data %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name))
+
+loc_name <- c("year", "location_name")
+
+## stations removed in PM2.5 for daily filter
+unique_locations_hourly_pm25 <- hourly_all %>% filter(parameter == pm25) %>% mutate(year = year(date)) %>%
+  ungroup() %>%
+  distinct(year, location_name)
+unique_locations_daily_pm25 <- daily_pm25_data %>%
+  ungroup() %>%
+  distinct(year, location_name)
+locations_only_in_hourly_by_year_pm25 <- unique_locations_hourly_pm25 %>%
+  anti_join(unique_locations_daily_pm25, by = loc_name)
+write.csv(locations_only_in_hourly_by_year_pm25, "2025_PM25_stations_removed_by_year_due_to_daily_comp_criteria_ncap.csv", row.names = F)
+
+## stations removed in PM10 for daily filter
+unique_locations_hourly_pm10 <- hourly_all %>% filter(parameter == pm10) %>% mutate(year = year(date)) %>%
+  ungroup() %>%
+  distinct(year, location_name)
+unique_locations_daily_pm10 <- daily_pm10_data %>%
+  ungroup() %>%
+  distinct(year, location_name)
+locations_only_in_hourly_by_year_pm10 <- unique_locations_hourly_pm10 %>%
+  anti_join(unique_locations_daily_pm10, by = loc_name)
+write.csv(locations_only_in_hourly_by_year_pm10, here("2025_report", "2025_PM10_stations_removed_by_year_due_to_daily_comp_criteria_ncap.csv"), row.names = F)
+
+# dupes <- monthly_pm25_data %>%
+#   group_by(month, year, location_name, parameter) %>%
+#   filter(n() > 1) %>%
+#   ungroup()
+
+monthly_pm25_data <- daily_all %>%
+  filter(parameter %in% pm25) %>%
+  group_by(state_name, city_name, location_name, file_name, year, month, parameter) %>%
+  summarise(days_available = n_distinct(date),
+            month_completeness = ifelse(days_available >= threshold_days, yes, no),
+            month_average = ifelse(days_available >= threshold_days, mean(day_average, na.rm = T), NA)) %>%
+  filter(month_completeness == yes)
+saveRDS(monthly_pm25_data, "2025_PM25_monthly_data_completeness.rds")
+
+# monthly_pm25_data_Varanasi <- hourly_all %>%
+#   filter(parameter %in% pm25) %>%
+#   filter(city_name == "Patancheru")
+
+monthly_pm10_data <- daily_all %>%
+  filter(parameter %in% pm10) %>%
+  group_by(state_name, city_name, location_name, file_name, year, month, parameter) %>%
+  summarise(days_available = n_distinct(date),
+            month_completeness = ifelse(days_available >= threshold_days, yes, no),
+            month_average = ifelse(days_available >= threshold_days, mean(day_average, na.rm = T), NA)) %>%
+  filter(month_completeness == yes)
+saveRDS(monthly_pm10_data, here("data/05-11-2025 Report files", "2025_PM10_monthly_data_completeness.rds"))
+
+monthly_pm25 <- daily_all %>%
+  filter(parameter %in% pm25) %>%
+  group_by(state_name, city_name, location_name, file_name, year, month, parameter) %>%
+  summarise(days_available = n_distinct(date),
+            month_completeness = ifelse(days_available >= threshold_days, yes, no),
+            month_average = ifelse(days_available >= threshold_days, mean(day_average, na.rm = T), NA)) %>%
+  filter(month_completeness == yes) %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name))
+
+monthly_pm10 <- daily_all %>%
+  filter(parameter %in% pm10) %>%
+  group_by(state_name, city_name, location_name, file_name, year, month, parameter) %>%
+  summarise(days_available = n_distinct(date),
+            month_completeness = ifelse(days_available >= threshold_days, yes, no),
+            month_average = ifelse(days_available >= threshold_days, mean(day_average, na.rm = T), NA)) %>%
+  filter(month_completeness == yes) %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name))
+
+
+## stations removed in PM2.5 for monthly filter
+unique_locations_monthly_pm25 <- monthly_pm25_data %>%
+  ungroup() %>%
+  distinct(year, location_name)
+locations_only_in_daily_by_year_pm25 <- unique_locations_daily_pm25 %>%
+  anti_join(unique_locations_monthly_pm25, by = loc_name)
+write.csv(locations_only_in_daily_by_year_pm25, here("2025_report", "2025_PM25_stations_removed_by_year_due_to_monthly_comp_criteria_ncap.csv"), row.names = F)
+
+## stations removed in PM10 for monthly filter
+unique_locations_monthly_pm10 <- monthly_pm10_data %>%
+  ungroup() %>%
+  distinct(year, location_name)
+locations_only_in_daily_by_year_pm10 <- unique_locations_daily_pm10 %>%
+  anti_join(unique_locations_monthly_pm10, by = loc_name)
+write.csv(locations_only_in_daily_by_year_pm10, here("2025_report", "2025_PM10_stations_removed_by_year_due_to_monthly_comp_criteria_ncap.csv"), row.names = F)
+
+yearly_pm25_data <- monthly_pm25_data %>%
+  group_by(state_name, city_name, location_name, file_name, year, parameter) %>%
+  summarise(months_available = n_distinct(month),  # Count days with completeness "Yes"
+            year_completeness = ifelse(months_available >= threshold_months, yes, no),
+            year_average = ifelse(months_available >= threshold_months, mean(month_average, na.rm = T), NA)) %>%
+  filter(year_completeness == yes) %>%
+  mutate(annual_limit = 40)
+saveRDS(yearly_pm25_data, here("data/05-11-2025 Report files", "2025_PM25_yearly_data_completeness.rds"))
+
+
+yearly_pm10_data <- monthly_pm10_data %>%
+  group_by(state_name, city_name, location_name, file_name, year, parameter) %>%
+  summarise(months_available = n_distinct(month),  # Count days with completeness "Yes"
+            year_completeness = ifelse(months_available >= threshold_months, yes, no),
+            year_average = ifelse(months_available >= threshold_months, mean(month_average, na.rm = T), NA)) %>%
+  filter(year_completeness == yes) %>%
+  mutate(annual_limit = 60)
+saveRDS(yearly_pm10_data, here("data/05-11-2025 Report files", "2025_PM10_yearly_data_completeness.rds"))
+
+
+yearly_pm25 <- monthly_pm25_data %>%
+  group_by(state_name, city_name, location_name, file_name, year, parameter) %>%
+  summarise(months_available = n_distinct(month),  # Count days with completeness "Yes"
+            year_completeness = ifelse(months_available >= threshold_months, yes, no),
+            year_average = ifelse(months_available >= threshold_months, mean(month_average, na.rm = T), NA)) %>%
+  filter(year_completeness == yes) %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name))
+
+yearly_pm10 <- monthly_pm10_data %>%
+  group_by(state_name, city_name, location_name, file_name, year, parameter) %>%
+  summarise(months_available = n_distinct(month),  # Count days with completeness "Yes"
+            year_completeness = ifelse(months_available >= threshold_months, yes, no),
+            year_average = ifelse(months_available >= threshold_months, mean(month_average, na.rm = T), NA)) %>%
+  filter(year_completeness == yes) %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name))
+
+
+## stations removed in PM2.5 for yearly filter
+unique_locations_yearly_pm25 <- yearly_pm25_data %>%
+  ungroup() %>%
+  distinct(year, location_name)
+locations_only_in_monthly_by_year_pm25 <- unique_locations_monthly_pm25 %>%
+  anti_join(unique_locations_yearly_pm25, by = loc_name)
+write.csv(locations_only_in_monthly_by_year_pm25, here("2025_report", "2025_PM25_stations_removed_by_year_due_to_yearly_comp_criteria_ncap.csv"), row.names = F)
+
+## stations removed in PM10 for yearly filter
+unique_locations_yearly_pm10 <- yearly_pm10_data %>%
+  ungroup() %>%
+  distinct(year, location_name)
+locations_only_in_monthly_by_year_pm10 <- unique_locations_monthly_pm10 %>%
+  anti_join(unique_locations_yearly_pm10, by = loc_name)
+write.csv(locations_only_in_monthly_by_year_pm10, here("2025_report", "2025_PM10_stations_removed_by_year_due_to_yearly_comp_criteria_ncap.csv"), row.names = F)
+
+## yearly change for location_name and city_name in PM2.5 for yearly complete data
+yearly_pm25_data <- yearly_pm25_data %>%
+  dplyr::select(year, city_name, state_name, year_average, everything()) %>%
+  ungroup() %>%
+  group_by(city_name, state_name, year) %>%
+  mutate(city_year_average = mean(year_average, na.rm = T)) %>%
+  arrange(city_name, state_name, year) %>%
+  group_by(city_name, state_name) %>%
+  mutate(city_annual_per_change = (city_year_average - lag(city_year_average)) /
+           lag(city_year_average) * 100,
+         city_annual_change = city_year_average - lag(city_year_average)) %>%
+  ungroup() %>%
+  arrange(location_name, city_name, state_name, year) %>%
+  group_by(location_name, city_name, state_name) %>%
+  mutate(station_annual_per_change = (year_average - lag(year_average)) /
+           lag(year_average) * 100,
+         station_annual_change = year_average - lag(year_average))
+write.csv(yearly_pm25_data, here("2025_report",  "2025_PM25_yearly_change_station_wise_city_wise_annual_completeness_criteria_ncap.csv"), row.names = F)
+
+
+yearly_pm25_data_change <- yearly_pm25_data %>%
+  group_by(location_name, city_name, state_name) %>%
+  mutate(min_year = min(year, na.rm = T),
+         max_year = max(year, na.rm = T)) %>%
+  group_by(location_name, city_name, state_name) %>%
+  filter(year == min_year | year == max_year) %>%
+  filter(min_year != max_year) %>%
+  dplyr::select(year, location_name, city_name, state_name, min_year, max_year, year_average) %>%
+  distinct(across(everything())) %>%
+  arrange(year, location_name, city_name, state_name) %>%
+  group_by(location_name, city_name, state_name) %>%
+  mutate(long_term_per_change = (year_average - lag(year_average)) /
+           lag(year_average) * 100,
+         long_term_per_change = year_average - lag(year_average))
+write.csv(yearly_pm25_data_change, here("2025_report", "2025_PM25_yearly_change_long_term_ncap.csv"))
+
+
+yearly_pm25_data_stations <- yearly_pm25_data %>%
+  distinct(year, location_name, city_name, state_name)
+write.csv(yearly_pm25_data_stations, here("2025_report", "2025_PM25_annual_complete_data_station_info_ncap.csv"), row.names = F)
+
+yearly_pm25_data_stations_3yrs <- yearly_pm25_data_stations %>%
+  group_by(location_name, city_name, state_name) %>%
+  summarise(n_years = n_distinct(year)) %>%
+  filter(n_years >= 3)
+```
+
+
+## Total stations 
+
+```{r}
+hourly_all <- readRDS(here("data/05-11-2025 Report files", "2025_04_12_HEI_hourly_data.rds")) %>%
+  filter(!str_starts(location_name, "US Diplomatic Post:")) %>%
+  filter(city_name %in% unique(ncap_list$City_name))
+
+hourly_pm25 <- hourly_all %>%
+  filter(parameter == pm25) %>%
+  mutate(year = year(observation_hour_start)) %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name),
+            n_cities = n_distinct(city_name))
+print("total_stations_pm25")
+hourly_pm25
+hourly_pm25_list <- hourly_all %>%
+  filter(parameter == pm25) %>%
+  mutate(year = year(observation_hour_start)) %>%
+  group_by(year) %>%
+  dplyr::select(year, location_name, city_name, state_name) %>%
+  distinct(across(everything()))
+write.csv(hourly_pm25_list, here::here("2025_report", "Total number of stations & cities for PM2.5 (2017-2024).csv"), row.names = F)
+hourly_pm10 <- hourly_all %>%
+  filter(parameter == pm10) %>%
+  mutate(year = year(observation_hour_start)) %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name),
+            n_cities = n_distinct(city_name))
+print("total_stations_pm10")
+hourly_pm10
+
+hourly_pm10_list <- hourly_all %>%
+  filter(parameter == pm10) %>%
+  mutate(year = year(observation_hour_start)) %>%
+  group_by(year) %>%
+  dplyr::select(year, location_name, city_name, state_name) %>%
+  distinct(across(everything()))
+write.csv(hourly_pm10_list, here::here("2025_report", "Total number of stations & cities for PM10 (2017-2024).csv"), row.names = F)
+
+```
+
+## Annual completeness
+
+```{r}
+read_pm10 <- read_csv(here::here("data/2025_PM10_annual_complete_data_station_info.csv")) %>%
+  filter(!str_starts(location_name, "US Diplomatic Post:")) %>%
+  filter(city_name %in% unique(ncap_list$City_name))
+
+
+annual_complete_pm10 <- read_pm10 %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name),
+            n_cities = n_distinct(city_name))
+print("annual_complete_pm10")
+annual_complete_pm10
+read_pm25 <- read_csv(here::here("data/2025_PM25_annual_complete_data_station_info.csv")) %>%
+  filter(!str_starts(location_name, "US Diplomatic Post:")) %>%
+  filter(city_name %in% unique(ncap_list$City_name))
+
+
+annual_complete_pm25 <- read_pm25 %>%
+  group_by(year) %>%
+  summarise(n_stations = n_distinct(location_name),
+            n_cities = n_distinct(city_name))
+print("annual_complete_pm25")
+annual_complete_pm25
+```
+
+## Any 5 years or 3 years
+
+
+```{r}
+data_all_years_pm25 <- read_pm25 %>%
+  group_by(location_name, city_name, state_name) %>%
+  summarise(n_years = n_distinct(year))
+
+data_all_years_pm25_5 <- data_all_years_pm25 %>%
+  filter(n_years >= 5)
+write.csv(data_all_years_pm25_5, here::here("2025_report",
+                                            "Number of stations & cities that meet annual completeness criteria for PM2.5 for more than 5 years.csv"), row.names = F)
+data_all_years_pm25_5_sum <- data_all_years_pm25_5 %>%
+  group_by(n_years) %>%
+  summarise(n_stations = n_distinct(location_name),
+            n_cities = n_distinct(city_name))
+print("data_all_years_pm25_5_sum")
+data_all_years_pm25_5_sum
+
+
+data_all_years_pm25_3 <- data_all_years_pm25 %>%
+  filter(n_years >= 3)
+write.csv(data_all_years_pm25_3, here::here("2025_report", "Number of stations & cities that meet annual completeness criteria for PM2.5 for more than 3 years.csv"), row.names = F)
+data_all_years_pm25_3_sum <- data_all_years_pm25_3 %>%
+  group_by(n_years) %>%
+  summarise(n_stations = n_distinct(location_name),
+            n_cities = n_distinct(city_name))
+print("data_all_years_pm25_3_sum")
+data_all_years_pm25_3_sum
+
+
+data_all_years_pm10 <- read_pm10 %>%
+  group_by(location_name, city_name, state_name) %>%
+  summarise(n_years = n_distinct(year))
+
+data_all_years_pm10_5 <- data_all_years_pm10 %>%
+  filter(n_years >= 5)
+write.csv(data_all_years_pm10_5, here::here("2025_report", "Number of stations & cities that meet annual completeness criteria for PM10 for more than 5 years.csv"), row.names = F)
+
+
+
+data_all_years_pm10_5_sum <- data_all_years_pm10_5 %>%
+  group_by(n_years) %>%
+  summarise(n_stations = n_distinct(location_name),
+            n_cities = n_distinct(city_name))
+
+print("data_all_years_pm10_5_sum")
+data_all_years_pm10_5_sum
+
+data_all_years_pm10_3 <- data_all_years_pm10 %>%
+  filter(n_years >= 3)
+write.csv(data_all_years_pm10_3, here::here("2025_report", "Number of stations & cities that meet annual completeness criteria for PM10 for more than 3 years.csv"), row.names = F)
+data_all_years_pm10_3_sum <- data_all_years_pm10_3 %>%
+  group_by(n_years) %>%
+  summarise(n_stations = n_distinct(location_name),
+            n_cities = n_distinct(city_name))
+
+print("data_all_years_pm10_3_sum")
+data_all_years_pm10_3_sum
+
+```
+
+## Continious 5 years or 3 years
+
+```{r}
+data_pm10_consecutive <- read_pm10 %>%
+  distinct(location_name, city_name, state_name, year) %>%
+  arrange(location_name, city_name, state_name, year) %>%
+  group_by(location_name, city_name, state_name) %>%
+  summarise(
+    years = list(sort(unique(year))),
+    total_years_available = n_distinct(year),
+    .groups = "drop"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    consec_groups = list(
+      rle(diff(unlist(years)) == 1)
+    ),
+    consecutive_years = {
+      consec <- consec_groups
+      if (length(consec$lengths) > 0) {
+        max(cumsum(consec$lengths[consec$values]) + 1, na.rm = TRUE)
+      } else {
+        1
+      }
+    }
+  ) %>%
+  ungroup() %>%
+  dplyr::select(-consec_groups) %>%
+  mutate(years = as.character(years))
+write.csv(data_pm10_consecutive, here::here("2025_report", "Number of stations & cities that meet annual completeness criteria continuously for PM10 for all years.csv"), row.names = F)
+
+data_consecutive_pm10_5 <- data_pm10_consecutive %>%
+  filter(consecutive_years >= 5)
+write.csv(data_consecutive_pm10_5, here::here("2025_report", "Number of stations & cities that meet annual completeness criteria continuously for PM10 for more than 5 years.csv"), row.names = F)
+
+data_consecutive_pm10_5_sum <- data_consecutive_pm10_5 %>%
+  group_by(consecutive_years) %>%
+  summarise(n_stations = n_distinct(location_name),
+            n_cities = n_distinct(city_name))
+print("data_consecutive_pm10_5_sum")
+data_consecutive_pm10_5_sum
+
+data_consecutive_pm10_3 <- data_pm10_consecutive %>%
+  filter(consecutive_years >= 3)
+write.csv(data_consecutive_pm10_3,here::here("2025_report",  "Number of stations & cities that meet annual completeness criteria continuously for PM10 for more than 3 years.csv"), row.names = F)
+
+data_consecutive_pm10_3_sum <- data_consecutive_pm10_3 %>%
+  group_by(consecutive_years) %>%
+  summarise(n_stations = n_distinct(location_name),
+            n_cities = n_distinct(city_name))
+
+print("data_consecutive_pm10_3_sum")
+data_consecutive_pm10_3_sum
+
+data_all_years_pm10_3 <- data_pm10_consecutive %>%
+  filter(total_years_available >= 3)
+write.csv(data_all_years_pm10_3, here::here("2025_report", "Number of stations & cities that meet annual completeness criteria for PM10 for more than 3 years.csv"), row.names = F)
+
+data_all_years_pm10_3_sum <- data_all_years_pm10_3 %>%
+  group_by(total_years_available) %>%
+  summarise(n_stations = n_distinct(location_name),
+            n_cities = n_distinct(city_name))
+
+print("data_all_years_pm10_3_sum")
+data_all_years_pm10_3_sum
+```
+
+
+```{r}
+data_pm25_consecutive <- read_pm25 %>%
+  distinct(location_name, city_name, state_name, year) %>%
+  arrange(location_name, city_name, state_name, year) %>%
+  group_by(location_name, city_name, state_name) %>%
+  summarise(
+    years = list(sort(unique(year))),
+    total_years_available = n_distinct(year),
+    .groups = "drop"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    consec_groups = list(
+      rle(diff(unlist(years)) == 1)
+    ),
+    consecutive_years = {
+      consec <- consec_groups
+      if (length(consec$lengths) > 0) {
+        max(cumsum(consec$lengths[consec$values]) + 1, na.rm = TRUE)
+      } else {
+        1
+      }
+    }
+  ) %>%
+  ungroup() %>%
+  dplyr::select(-consec_groups) %>%
+  mutate(years = as.character(years))
+write.csv(data_pm25_consecutive, here::here("2025_report",
+                                            "Number of stations & cities that meet annual completeness criteria continuously for PM2.5 for all years.csv"), row.names = F)
+
+data_consecutive_pm25_3 <- data_pm25_consecutive %>%
+  filter(consecutive_years >= 3)
+write.csv(data_consecutive_pm25_3, here::here("2025_report", "Number of stations & cities that meet annual completeness criteria continuously for PM2.5 for more than 3 years.csv"), row.names = F)
+
+data_consecutive_pm25_3_sum <- data_consecutive_pm25_3 %>%
+  group_by(consecutive_years) %>%
+  summarise(n_stations = n_distinct(location_name),
+            n_cities = n_distinct(city_name))
+
+print("data_consecutive_pm25_3_sum")
+data_consecutive_pm25_3_sum
+
+data_all_years_pm25_3 <- data_pm25_consecutive %>%
+  filter(total_years_available >= 3)
+write.csv(data_all_years_pm25_3, here::here("2025_report", "Number of stations & cities that meet annual completeness criteria for PM2.5 for more than 3 years.csv"), row.names = F)
+
+data_all_years_pm25_3_sum <- data_all_years_pm25_3 %>%
+  group_by(total_years_available) %>%
+  summarise(n_stations = n_distinct(location_name),
+            n_cities = n_distinct(city_name))
+
+print("data_all_years_pm25_3_sum")
+data_all_years_pm25_3_sum
+
+
+data_consecutive_pm25_5 <- data_pm25_consecutive %>%
+  filter(consecutive_years >= 5)
+write.csv(data_consecutive_pm25_5, here::here("2025_report", "Number of stations & cities that meet annual completeness criteria continuously for PM2.5 for more than 5 years.csv"), row.names = F)
+
+data_consecutive_pm25_5_sum <- data_consecutive_pm25_5 %>%
+  group_by(consecutive_years) %>%
+  summarise(n_stations = n_distinct(location_name),
+            n_cities = n_distinct(city_name))
+
+print("data_consecutive_pm25_5_sum")
+data_consecutive_pm25_5_sum
+
+```
+
+
+
+
+## Exceedance 
+
+```{r}
+## exceedance of annual complete data by NAAQS daily value in each year
+daily_all <- readRDS(here("data/05-11-2025 Report files", "2025_04_12_HEI_daily_data_completeness.rds")) %>%
+  filter(!str_starts(location_name, "US Diplomatic Post:")) %>% 
+  filter(city_name %in% unique(ncap_list$City_name))
+
+daily_pm25_data <- readRDS(here("data/05-11-2025 Report files", "2025_PM25_daily_data_completeness.rds")) %>%
+  filter(!str_starts(location_name, "US Diplomatic Post:"))
+
+daily_pm10_data <- readRDS(here("data/05-11-2025 Report files", "2025_PM10_daily_data_completeness.rds")) %>%
+  filter(!str_starts(location_name, "US Diplomatic Post:")) 
+
+yearly_pm25_data <- readRDS(here("data/05-11-2025 Report files", "2025_PM25_yearly_data_completeness.rds"))
+
+yearly_pm10_data <- readRDS(here("data/05-11-2025 Report files", "2025_PM10_yearly_data_completeness.rds"))
+
+unique_locations_yearly_pm25 <- yearly_pm25_data %>%
+  ungroup() %>%
+  distinct(year, location_name)
+
+unique_locations_yearly_pm10 <- yearly_pm10_data %>%
+  ungroup() %>%
+  distinct(year, location_name)
+
+loc_name <- c("year", "location_name")
+
+pm25_exceedance_days <- daily_pm25_data %>%
+  ungroup() %>%
+  right_join(., unique_locations_yearly_pm25, by = loc_name) %>%
+  ungroup() %>%
+  filter(day_average > naaqs_pm25_daily) %>%
+  group_by(year, location_name, state_name, city_name, parameter) %>%
+  summarise(exceedance_days = n_distinct(date)) %>%
+  ungroup()
+write.csv(pm25_exceedance_days, here("2025_report", "2025_PM25_exceedance_naaqs_daily_value_annual_completeness_ncap.csv"), row.names = F)
+
+summary_yearly_pm25_data <- yearly_pm25_data %>%
+  group_by(year) %>%
+  summarise(
+    pm25_total_stations = n(),
+    stations_exceeding = sum(year_average > annual_limit, na.rm = TRUE),
+    percent_exceeding = round(100 * stations_exceeding / pm25_total_stations, 1)
+  ) %>%
+  mutate(
+    pm25_summary = paste0(stations_exceeding, " (", percent_exceeding, "%)")
+  ) %>%
+  select(year, pm25_total_stations, pm25_summary)
+
+write.csv(summary_yearly_pm25_data, here("2025_report", "2025_PM25_stations_exceedance_naaqs_annual_value_annual_completeness_ncap.csv"), row.names = F)
+
+pm10_exceedance_days <- daily_pm10_data %>%
+  ungroup() %>%
+  right_join(., unique_locations_yearly_pm10, by = loc_name) %>%
+  ungroup() %>%
+  filter(day_average > naaqs_pm10_daily) %>%
+  group_by(year, location_name, state_name, city_name, parameter) %>%
+  summarise(exceedance_days = n_distinct(date)) %>%
+  ungroup()
+write.csv(pm10_exceedance_days, here("2025_report", "2025_PM10_exceedance_naaqs_daily_value_annual_completeness_bcap.csv"), row.names = F)
+
+summary_yearly_pm10_data <- yearly_pm10_data %>%
+  group_by(year) %>%
+  summarise(
+    pm10_total_stations = n(),
+    stations_exceeding = sum(year_average > annual_limit, na.rm = TRUE),
+    percent_exceeding = round(100 * stations_exceeding / pm10_total_stations, 1)
+  ) %>%
+  mutate(
+    pm10_summary = paste0(stations_exceeding, " (", percent_exceeding, "%)")
+  ) %>%
+  select(year, pm10_total_stations, pm10_summary)
+
+write.csv(summary_yearly_pm10_data, here("2025_report", "2025_PM10_stations_exceedance_naaqs_annual_value_annual_completeness_ncap.csv"), row.names = F)
+
+```
+
+
+## TS 
+
+```{r}
+pacman::p_load(trend, tidyverse, readxl, here, openair)
+
+## Mann-Kendall test for each parameter
+asia_tz <- "Asia/Kolkata"
+format_asia <- "%Y-%m-%d %H:%M:%S"
+paste_t <- "-01-01 01:00:00"
+key <- c("district_name", "district_code", "state_name", "date", "year")
+# list_pollutants <- c("pm25", "co", "o3", "pm10", "no2", "so2")
+list_pollutants <- c("pm25", "pm10")
+
+cols_to_keep <- c("date", "year", "location_name", "city_name", "district_name", "district_code", "state_name")
+
+ncap_list <- read_xlsx(here("data", "Clean sheet_10-05-2024.xlsx"), sheet = 2) %>%
+  mutate(City_name = ifelse(City_name == "Amaravati", "Amravati", City_name),
+         City_name = ifelse(City_name == "Dharwad", "Hubballi", City_name)) %>%
+  filter(!is.na(City_name)) %>%
+  filter(City_name != 0) %>%
+  distinct(City_name)
+
+pollution_data <- readRDS(here("data/05-11-2025 Report files", "2025_pollutant_data.rds"))
+
+pm25_annual_completeness <- read_csv(here::here("data/2025_PM25_annual_complete_data_station_info.csv"))
+pm10_annual_completeness <- read_csv(here::here("data/2025_PM10_annual_complete_data_station_info.csv"))
+
+pm25_annual_completeness_ncap <- pm25_annual_completeness %>%
+  filter(city_name %in% unique(ncap_list$City_name))
+pm10_annual_completeness_ncap <- pm10_annual_completeness %>%
+  filter(city_name %in% unique(ncap_list$City_name))
+
+key_full <- c("location_name", "state_name", "city_name", "year")
+
+group_avg <- c("location_name", "district_name", "city_name", "state_name", "district_code", "season_req")
+# pollution_data_daily <- readRDS("2025_PM_daily_data.rds")
+pollution_data_daily <- timeAverage(pollution_data %>%
+                                      dplyr::select("date" = date_time, everything()) %>%
+                                      mutate(year = year(date)),
+                                         avg.time = "day",
+                                         type = group_avg)
+# saveRDS(pollution_data_daily, "2025_PM_daily_data.rds")
+
+## Theil Sen
+## For PM2.5, eg - i <- "Model Town, Patiala - PPCB"; j <- "pm25"
+cols_to_keep <- c("date", "year", "location_name", "city_name", "district_name",
+                  "district_code", "state_name", "season_req")
+type_col <- c("location_name", "city_name", "district_name",
+              "district_code", "state_name")
+pollution_data_daily <- pollution_data_daily %>%
+  mutate(year = year(date)) %>%
+  mutate(
+    month = month(date),
+    season_req = case_when(
+      month %in% c(1, 2) ~ "Winter",
+      month %in% c(3, 4, 5) ~ "Pre-Monsoon",
+      month %in% c(6, 7, 8, 9) ~ "Southwest-Monsoon",
+      month %in% c(10, 11, 12) ~ "Post-Monsoon"
+    )
+  ) %>%
+  select(-month) %>%
+  filter(!is.na(year))
+
+key_new <- c("city_name", "location_name", "state_
+main_long_term_year <- data.frame()
+res_long_term_year <- data.frame()
+main_long_term_year_deseason <- data.frame()
+res_long_term_year_deseason <- data.frame()
+main_long_term_deseason_year_season <- data.frame()name", "year")
+type_f <- c("city_name", "location_name", "state_name", "district_name", "district_code")
+
+main_long_term <- data.frame()
+res_long_term <- data.frame()
+main_long_term_deseason <- data.frame()
+res_long_term_deseason <- data.frame()
+res_long_term_deseason_year_season <- data.frame()
+
+
+for(j in list_pollutants) {
+  if(j == "pm25") {
+    data_com_pm <- pm25_annual_completeness
+  }
+  if(j == "pm10") {
+    data_com_pm <- pm10_annual_completeness
+  }
+  pollutant_data_sub <- pollution_data_daily %>%
+    dplyr::select(date, year, location_name, city_name, season_req,
+                  district_code, district_name, state_name, contains("average")) %>%
+    left_join(data_com_pm,. , by = key_new) %>%
+    rename_with(~ gsub("^average_", "", .x), .cols = !all_of(cols_to_keep)) %>%
+    rename_with(tolower) %>%
+    dplyr::select(all_of(cols_to_keep), {{ j }}) %>%
+    filter(!is.na(!!sym(j)))
+  for(i in unique(pollution_data_daily$location_name)) {
+    pollutant_data_sub_ln <- pollutant_data_sub %>%
+      arrange(date) %>%
+      filter(location_name == i)
+
+    if(nrow(pollutant_data_sub_ln) >= 5 && !is.null(pollutant_data_sub_ln)) {
+
+      pdf(file = here("2025_report", paste0("2025_ts_", j, 
+                                                "_", i, "_plot.pdf")),
+          width = 10, height = 9)
+
+      theil_sen_result <- TheilSen(pollutant_data_sub_ln, pollutant = j, 
+                                   date.format = "%b-%Y", plot = T,
+                                   avg.time = "month", alpha = 0.05, dec.place = 1)
+
+      dev.off()
+
+      if(nrow(theil_sen_result$data$main.data) >= 6 && !is.null(theil_sen_result$data$main.data)) {
+
+        theil_sen_result$data$main.data$location_name <- i
+
+        main_long_term <- bind_rows(main_long_term, theil_sen_result$data$main.data)
+
+        theil_sen_result$data$res2$location_name <- i
+
+        res_long_term <- bind_rows(res_long_term, theil_sen_result$data$res2)
+      }
+
+      pdf(file = here("2025_report", paste0("2025_ts_deseason_", j, "_", i, "_plot.pdf")),
+          width = 10, height = 9)
+
+      theil_sen_result_deseason <- TheilSen(pollutant_data_sub_ln, pollutant = j,
+                                            date.format = "%b-%Y", deseason = T, plot = T, dec.place = 1,
+                                            avg.time = "month", alpha = 0.05)
+
+      dev.off()
+
+      if(nrow(theil_sen_result_deseason$data$main.data) >= 6 && !is.null(theil_sen_result_deseason$data$main.data)) {
+
+        theil_sen_result_deseason$data$main.data$location_name <- i
+
+        main_long_term_deseason <- bind_rows(main_long_term_deseason, theil_sen_result_deseason$data$main.data)
+
+        theil_sen_result_deseason$data$res2$location_name <- i
+
+        res_long_term_deseason <- bind_rows(res_long_term_deseason, theil_sen_result_deseason$data$res2)
+      }
+    }
+  }
+  write.csv(main_long_term, here("2025_report", paste0("2025_ts_df_", j, ".csv")), row.names = F)
+  write.csv(res_long_term, here("2025_report", paste0("2025_ts_res_", j, ".csv")), row.names = F)
+  write.csv(main_long_term_deseason, here("2025_report", paste0("2025_ts_deseason_df_", j, ".csv")), row.names = F)
+  write.csv(res_long_term_deseason, here("2025_report", paste0("2025_ts_deseason_res_", j, ".csv")), row.names = F)
+}
+
+```
+
+
+## TS weather normalised 
+
+```{r}
+library(trend)
+library(tidyverse)
+library(readxl)
+library(here)
+library(openair)
+
+## Mann-Kendall test for each parameter
+asia_tz <- "Asia/Kolkata"
+format_asia <- "%Y-%m-%d %H:%M:%S"
+paste_t <- "-01-01 01:00:00"
+key <- c("district_name", "district_code", "state_name", "date", "year")
+# list_pollutants <- c("pm25", "co", "o3", "pm10", "no2", "so2")
+list_pollutants <- c("pm25", "pm10")
+
+cols_to_keep <- c("date", "year", "location_name", "city_name", "district_name", "district_code", "state_name")
+
+ncap_list <- read_xlsx(here("data", "Clean sheet_10-05-2024.xlsx"), sheet = 2) %>%
+  mutate(City_name = ifelse(City_name == "Amaravati", "Amravati", City_name),
+         City_name = ifelse(City_name == "Dharwad", "Hubballi", City_name)) %>%
+  filter(!is.na(City_name)) %>%
+  filter(City_name != 0) %>%
+  distinct(City_name)
+
+pm25_annual_completeness <- read_csv(here::here("data/2025_PM25_annual_complete_data_station_info.csv"))
+pm10_annual_completeness <- read_csv(here::here("data/2025_PM10_annual_complete_data_station_info.csv"))
+
+pm25_annual_completeness_ncap <- pm25_annual_completeness %>%
+  filter(city_name %in% unique(ncap_list$City_name))
+pm10_annual_completeness_ncap <- pm10_annual_completeness %>%
+  filter(city_name %in% unique(ncap_list$City_name))
+
+## Theil Sen
+## For PM2.5, eg - i <- "Model Town, Patiala - PPCB"; j <- "pm25"
+cols_to_keep <- c("date", "year", "location_name", "city_name", "district_name",
+                  "district_code", "state_name", "season_req")
+type_col <- c("location_name", "city_name", "district_name",
+              "district_code", "state_name")
+# all_files <- readRDS("2025_PM_weather_normalized_files.rds")
+# saveRDS(all_files, "2025_no_temporal_vars_PM_weather_normalized_files.rds")
+
+pollution_data_daily <- readRDS(here("data/05-11-2025 Report files", "2025_PM_weather_normalized_files.rds")) %>%
+  mutate(year = year(date)) %>%
+  mutate(
+    month = month(date),
+    season_req = case_when(
+      month %in% c(1, 2) ~ "Winter",
+      month %in% c(3, 4, 5) ~ "Pre-Monsoon",
+      month %in% c(6, 7, 8, 9) ~ "Southwest-Monsoon",
+      month %in% c(10, 11, 12) ~ "Post-Monsoon"
+    )
+  ) %>%
+  select(-month) %>%
+  filter(!is.na(year))
+
+key_new <- c("city_name", "location_name", "state_name", "year")
+type_f <- c("city_name", "location_name", "state_name", "district_name", "district_code")
+
+main_long_term <- data.frame()
+res_long_term <- data.frame()
+
+
+for(j in list_pollutants) {
+  if(j == "pm25") {
+    data_com_pm <- pm25_annual_completeness
+  }
+  if(j == "pm10") {
+    data_com_pm <- pm10_annual_completeness %>%
+      filter(location_name != "Town Hall, Munger - BSPCB")
+  }
+  pollutant_data_sub <- pollution_data_daily %>%
+    dplyr::select(date, year, location_name, city_name, season_req,
+                  district_code, district_name, 
+                  state_name, value_predict, variable) %>%
+    filter(variable == j) %>%
+    distinct(across(everything())) %>%
+    pivot_wider(names_from = variable, values_from = value_predict) %>%
+    left_join(data_com_pm, ., by = key_new) %>%
+    dplyr::select(all_of(cols_to_keep), {{ j }}) %>%
+    filter(!is.na(!!sym(j)))
+  for(i in unique(pollution_data_daily$location_name)) {
+    pollutant_data_sub_ln <- pollutant_data_sub %>%
+      arrange(date) %>%
+      filter(location_name == i)
+    if(nrow(pollutant_data_sub_ln) >= 5 && 
+       !is.null(pollutant_data_sub_ln)) {
+      pdf(file = here("2025_report/TS_Weather", paste0("2025_ts_", 
+                            j, "_", i,
+                      "_with_temporal_vars_weather_normalised_plot.pdf")),
+          width = 10, height = 9)
+      theil_sen_result <- TheilSen(pollutant_data_sub_ln, pollutant = j,                                date.format = "%b-%Y", plot = T,
+                                   avg.time = "month", 
+                                   alpha = 0.05, dec.place = 1)
+      dev.off()
+      if(nrow(theil_sen_result$data$main.data) >= 6 &&
+         !is.null(theil_sen_result$data$main.data)) {
+        theil_sen_result$data$main.data$location_name <- i
+        main_long_term <- bind_rows(main_long_term,
+                                    theil_sen_result$data$main.data)
+        theil_sen_result$data$res2$location_name <- i
+        res_long_term <- bind_rows(res_long_term,
+                                   theil_sen_result$data$res2)
+      }
+    }
+  }
+  write.csv(main_long_term, here("2025_report/TS_Weather", paste0("2025_ts_df_", j, "_with_temporal_vars_weather_normalised.csv")), row.names = F)
+  write.csv(res_long_term, here("2025_report/TS_Weather", paste0("2025_ts_res_", j, "_with_temporal_vars_weather_normalised.csv")), row.names = F)
+}
+
+```
+
+
+## Figure 1. Annual average PM2.5 concentrations across 95 cities in 2024. The figure includes only the stations that met the study’s completeness criteria: at least 18 hours of data each day, 23 days each month, and 11 months each year. Source: Central Pollution Control Board, India
+
+```{r}
+library(pacman)
+p_load(sf, tidyverse, ggspatial, readxl, grid,
+       rnaturalearth, rnaturalearthdata, here)
+
+
+ncap_list <- read_xlsx(here("data", "NCAP_Data collection.xlsx"), sheet = 4) %>%
+  mutate(location_name = `Station information`,
+         City_name = City) %>%
+  fill(City_name, .direction = "down") %>%
+  mutate(City_name = ifelse(City_name == "Amaravati", "Amravati", City_name),
+         City_name = ifelse(City_name == "Dharwad", "Hubballi", City_name)) %>%
+  filter(!is.na(`Lat/Long...12`)) %>%
+  mutate(
+    lat = as.numeric(sub(".*Latitude:\\s*([0-9\\.]+).*", "\\1", `Lat/Long...12`)),
+    lon = as.numeric(sub(".*Longitude:\\s*([0-9\\.]+).*", "\\1", `Lat/Long...12`))
+  ) %>%
+  dplyr::select(location_name, City_name, lat, lon)
+
+read_second_file <- read_xlsx(here("data", "2025_01_24_sites_missing_lat_long.xlsx")) %>%
+  mutate(City_name = city_name,
+         lat = latitude,
+         lon = longitude) %>%
+  dplyr::select(location_name, City_name, lat, lon)
+
+all_file <- bind_rows(read_second_file, ncap_list) %>%
+  distinct(location_name, .keep_all = T)
+
+
+yearly_pm10_data <- readRDS(here("data/05-11-2025 Report files", "2025_PM10_yearly_data_completeness.rds")) %>%
+  filter(year == 2024) %>%
+  left_join(., all_file, by = c("location_name"))
+yearly_pm25_data <- readRDS(here("data/05-11-2025 Report files", "2025_PM25_yearly_data_completeness.rds")) %>%
+  filter(year == 2024) %>%
+  left_join(., all_file, by = c("location_name"))
+
+ncap_list_s <- read_xlsx(here("data", "NCAP_Data collection.xlsx"), sheet = 4) %>%
+  mutate(location_name = `Station information`,
+         City_name = City) %>%
+  fill(City_name, .direction = "down") %>%
+  mutate(City_name = ifelse(City_name == "Amaravati", "Amravati", City_name),
+         City_name = ifelse(City_name == "Dharwad", "Hubballi", City_name))
+
+yearly_pm10_summ <- readRDS(here("data/05-11-2025 Report files", "2025_PM10_yearly_data_completeness.rds")) %>%
+  filter(location_name %in% unique(ncap_list_s$location_name)) %>%
+  group_by(year) %>%
+  summarise(n_stations_pm10 = sum(!is.na(location_name)))
+
+yearly_pm25_summ <- readRDS(here("data/05-11-2025 Report files", "2025_PM25_yearly_data_completeness.rds")) %>%
+  filter(location_name %in% unique(ncap_list_s$location_name)) %>%
+  group_by(year) %>%
+  summarise(n_stations_pm25 = sum(!is.na(location_name)))
+
+yearly_sum <- bind_cols(yearly_pm10_summ, yearly_pm25_summ)
+
+
+
+## Get India map from Natural Earth
+india <- ne_countries(scale = "medium", returnclass = "sf") %>%
+  filter(name == "India")
+
+## Convert PM2.5 data to spatial points (ignore missing coords)
+pm25_sf <- yearly_pm25_data %>%
+  filter(!is.na(lat) & !is.na(lon)) %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+pm10_sf <- yearly_pm10_data %>%
+  filter(!is.na(lat) & !is.na(lon)) %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+## Bin year_average into categories
+## PM2.5 breakpoints & labels
+pm25_breaks <- c(0, 15, 40, 65, 150, 250, 350)
+pm25_labels <- c("0–15", "15–40", "40–65", "65–150", "150–250", "250–350")
+
+
+pm25_sf$pm25_category <- cut(pm25_sf$year_average,
+                             breaks = pm25_breaks,
+                             labels = pm25_labels,
+                             include.lowest = TRUE)
+
+## PM10 breakpoints & labels
+pm10_breaks <- c(0, 54, 154, 254, 354, 424, 504)
+pm10_labels <- c("0–54", "55–154", "155–254", "255–354", "355–424", "425–504")
+
+
+pm10_sf$pm10_category <- cut(pm10_sf$year_average,
+                             breaks = pm10_breaks,
+                             labels = pm10_labels,
+                             include.lowest = TRUE)
+
+aqi_colors <- c(
+  "0–15" = "#00E400",
+  "15–40" = "#FFFF00",
+  "40–65" = "#FF7E00",
+  "65–150" = "#FF0000",
+  "150–250" = "#8F3F97",
+  "250–350" = "#7E0023"
+)
+
+
+boundary <- st_read(here("data/India_Shapefile/State_country/", "India_State_Boundary.shp")) %>%
+  st_make_valid() %>%       
+  st_transform(4326) 
+
+boundary <- st_transform(boundary, st_crs(pm25_sf))
+
+bbox <- st_bbox(boundary) 
+
+# bbox <- st_bbox(st_union(st_geometry(boundary), st_geometry(pm25_sf)))
+
+
+pm25_map <- ggplot() +
+  geom_sf(data = boundary, fill = "gray95", 
+          color = "black") +
+  geom_sf(data = pm25_sf, 
+          aes(color = pm25_category), 
+          size = 3, alpha = 0.8) +
+  scale_color_manual(
+    name = expression(PM[2.5] ~ (mu * g/m^3)),
+    values = aqi_colors, drop = TRUE) +
+  annotation_north_arrow(location = "tr", 
+                         which_north = "true",
+                         style =
+                      north_arrow_fancy_orienteering(),
+                         pad_x = unit(0.3, "cm"), 
+                         pad_y = unit(0.3, "cm")) +
+  theme_void() +
+  theme(
+    legend.position = c(0, 0.15),
+    legend.direction = "vertical",
+    legend.justification = c(0, 0),           
+    legend.background = element_rect(
+      fill = alpha("white", 0.8), 
+      color = NA),
+    legend.title = element_text(size = 12, 
+                                face = "bold"),
+    legend.text = element_text(size = 10)
+  ) +
+  coord_sf(xlim = c(bbox["xmin"], bbox["xmax"]),
+           ylim = c(bbox["ymin"], bbox["ymax"]),
+           expand = TRUE)
+
+ggsave(filename = here("2025_report", "annual_complete_data_station_avg_pm25_2024_map.pdf"), plot = pm25_map, width = 10, height = 7, dpi = 350, device = "pdf")
+
+
+aqi_colors <- c(
+  "0–54" = "#00E400",
+  "55–154" = "#FFFF00",
+  "155–254" = "#FF7E00",
+  "255–354" = "#FF0000",
+  "355–424" = "#8F3F97",
+  "425–504" = "#7E0023"
+)
+
+pm10_map <- ggplot() +
+  geom_sf(data = boundary, fill = "gray95", color = "black") +
+  geom_sf(data = pm10_sf, aes(color = pm10_category), size = 3, alpha = 0.8) +
+  scale_color_manual(expression(PM[10] ~ (mu * g/m^3)), 
+                     values = aqi_colors, drop = TRUE) +
+  annotation_north_arrow(location = "tr", which_north = "true",
+                         style = north_arrow_fancy_orienteering(),
+                         pad_x = unit(0.3, "cm"), pad_y = unit(0.3, "cm")) +
+  theme_void() +
+  theme(
+    legend.position = c(0, 0.15),
+    legend.direction = "vertical",
+    legend.justification = c(0, 0),           # Anchor the legend box from the bottom-left
+    legend.background = element_rect(fill = alpha("white", 0.8), color = NA),
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 10)
+  ) +
+  coord_sf(xlim = c(bbox["xmin"], bbox["xmax"]),
+           ylim = c(bbox["ymin"], bbox["ymax"]),
+           expand = TRUE)
+
+ggsave(filename = here("2025_report", "annual_complete_data_station_avg_pm10_2024_map.pdf"), plot = pm10_map, width = 10, height = 7, dpi = 350, device = "pdf")
+
+```
+
