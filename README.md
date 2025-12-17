@@ -32,6 +32,7 @@ This repository contains only code. The data used in the analysis are not public
 
 •	Required R packages are listed within the scripts
 
+Note: Regulatory-grade, real-time air quality monitoring data from 2017–2024 was used for this analysis. Data for all NCAP cities was retrieved from the Central Control Room for Air Quality Management–All India repository through Earthmetry. The datasets from Earthmetry also included data from US Embassy stations in India and hence those stations were filtered in the script. 
 
 Data Availability
 The data used in this analysis are not publicly available and are therefore not included in this repository. This repository is intended to provide transparency and reproducibility of the analytical methods.
