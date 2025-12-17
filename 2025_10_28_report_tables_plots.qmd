@@ -47,6 +47,22 @@ theme_HEI <- list(theme(legend.text = element_text(size = 11),
                         axis.text = element_text(size = 12, colour = "black", face = "bold"),
                         panel.border = element_rect(colour = "black", fill = NA, size = 1)))
 
+year_colors <- c(
+  "2017" = "#E69F00", # Orange
+  "2018" = "#56B4E9", # Sky Blue
+  "2019" = "#009E73", # Bluish Green
+  "2020" = "#F0E442", # Yellow
+  "2021" = "#0072B2", # Blue
+  "2022" = "#D55E00", # Vermillion
+  "2023" = "#CC79A7", # Reddish Purple
+  "2024" = "#999999"  # Gray
+)
+
+f <- function(x) {
+  r <- quantile(x, probs = c(0.05, 0.25, 0.5, 0.75, 0.95))
+  names(r) <- c("ymin", "lower", "middle", "upper", "ymax")
+  r
+}
 
 # Define variables for filtering
 format_dt <- "%Y-%m-%d %H:%M:%S"
@@ -165,31 +181,6 @@ process_pollution_data <- function(path, file, threshold_hours, threshold_days, 
 return(list(daily_summary, monthly_summary, yearly_summary, data)) # add data for hourly
 }
 
-
-# for(i in pollution_data_list){
-#   result <- process_pollution_data(pollution_data_path, i, threshold_hours, threshold_days, threshold_months,
-#                                    format_dt, tz_asia, yes, no)
-#   daily_data <- result[[1]] %>%
-#     mutate(file_name = i)
-#   monthly_data <- result[[2]] %>%
-#     mutate(file_name = i)
-#   yearly_data <- result[[3]] %>%
-#     mutate(file_name = i)
-#   hourly_data <- result[[4]] %>%
-#     mutate(file_name = i)
-#   if(nrow(daily_data) > 0) {
-#     daily_all <- rbind(daily_all, daily_data)
-#     monthly_all <- rbind(monthly_all, monthly_data)
-#     yearly_all <- rbind(yearly_all, yearly_data)
-#     hourly_all <- rbind(hourly_all, hourly_data)
-#   }
-# }
-
-# daily_all <- daily_all %>%
-#   mutate(year = lubridate::year(date),
-#          month = format(date, "%b"))
-# saveRDS(hourly_all, here("data", "2025_04_12_HEI_hourly_data.rds"))
-
 daily_all <- readRDS(here("data/05-11-2025 Report files", 
                         "2025_04_12_HEI_daily_data_completeness.rds"))
 hourly_all <- readRDS(here("data/05-11-2025 Report files", 
@@ -208,11 +199,6 @@ pm10 <- c("PM10")
 
 
 ```{r}
-# hourly_all <- hourly_all %>%
-#   filter(!str_starts(location_name, "US Diplomatic Post:")) %>%
-#   filter(city_name %in% unique(ncap_list$City_name))
-# saveRDS(daily_all, "2025_04_12_HEI_daily_data_completeness.rds")
-
 hourly_pm25 <- hourly_all %>%
   filter(parameter == pm25) %>%
   mutate(year = year(observation_hour_start)) %>%
@@ -410,16 +396,6 @@ write.csv(pollution_data_daily_summ,
 Desc_order_2024_PM10.csv and Desc_order_2024_PM25.csv
 
 ```{r}
-# hourly_pm25 <- hourly_all %>%
-#   filter(parameter == pm25) %>%
-#   mutate(year = year(observation_hour_start)) %>%
-#   group_by(year) %>%
-#   summarise(n_stations = n_distinct(location_name))
-# hourly_pm10 <- hourly_all %>%
-#   filter(parameter == pm10) %>%
-#   mutate(year = year(observation_hour_start)) %>%
-#   group_by(year) %>%
-#   summarise(n_stations = n_distinct(location_name))
 daily_all <- readRDS(
   here("data/05-11-2025 Report files", 
        "2025_04_12_HEI_daily_data_completeness.rds")) %>%
@@ -792,17 +768,6 @@ write.csv(yearly_pm25_data,
 ## plots 
 
 ```{r}
-year_colors <- c(
-  "2017" = "#E69F00", # Orange
-  "2018" = "#56B4E9", # Sky Blue
-  "2019" = "#009E73", # Bluish Green
-  "2020" = "#F0E442", # Yellow
-  "2021" = "#0072B2", # Blue
-  "2022" = "#D55E00", # Vermillion
-  "2023" = "#CC79A7", # Reddish Purple
-  "2024" = "#999999"  # Gray
-)
-
 theme_HEI <- list(theme(legend.text = element_text(size = 14),
                         legend.title = element_blank(),
                         legend.position = "none",
@@ -947,16 +912,6 @@ monthly_summary_pm25_annual <- monthly_summary_pm25 %>%
 monthly_summary_pm10_annual <- monthly_summary_pm10 %>%
   left_join(pm10_annual_completeness, ., by = key_full)
 
-year_colors <- c(
-  "2017" = "#E69F00",
-  "2018" = "#56B4E9",
-  "2019" = "#009E73",
-  "2020" = "#F0E442",
-  "2021" = "#0072B2",
-  "2022" = "#D55E00",
-  "2023" = "#CC79A7",
-  "2024" = "purple"
-)
 
 for(i in unique(monthly_summary_pm25_annual$location_name)) {
   pollution_pm25_daily_sub <- monthly_summary_pm25_annual %>%
@@ -1005,22 +960,6 @@ for(i in unique(monthly_summary_pm10_annual$location_name)) {
 
 
 ```{r}
-f <- function(x) {
-  r <- quantile(x, probs = c(0.05, 0.25, 0.5, 0.75, 0.95))
-  names(r) <- c("ymin", "lower", "middle", "upper", "ymax")
-  r
-}
-
-year_colors <- c(
-  "2017" = "#E69F00",
-  "2018" = "#56B4E9",
-  "2019" = "#009E73",
-  "2020" = "#F0E442",
-  "2021" = "#0072B2",
-  "2022" = "#D55E00",
-  "2023" = "#CC79A7",
-  "2024" = "purple"
-)
 theme_HEI <- list(theme(legend.text = element_text(size = 12),
                         legend.title = element_blank(),
                         legend.position = "none",
@@ -1124,34 +1063,8 @@ ggsave(here::here("2025_report", paste0(year(now()), "_PM25_yearly_box_plot_annu
 
 
 ```{r}
-
-# Define variables for filtering
-format_dt <- "%Y-%m-%d %H:%M:%S"
-tz_asia <- "Asia/Kolkata"
-yes <- "Yes"
-no <- "No"
-
-## Define the thresholds for completeness
-threshold_hours <- 18
-threshold_days <- 23
-threshold_months <- 11
-naaqs_pm25_daily <- 60
-naaqs_pm10_daily <- 100
-
-## Define timezone
-tz_India <- "Asia/Kolkata"
-
 ## Read paths in a clean way, List pollution files and defining a empty data frame to store the data
 pollution_data_path <- here("data/CPCB/Pollutant")
-
-## Read the NCAP list of stations
-ncap_list <- read_xlsx(here("data", "Clean sheet_10-05-2024.xlsx"), sheet = 2) %>%
-  mutate(City_name = ifelse(City_name == "Amaravati", "Amravati", City_name),
-         City_name = ifelse(City_name == "Dharwad", "Hubballi", City_name)) %>%
-  filter(!is.na(City_name)) %>%
-  filter(City_name != 0) %>%
-  distinct(City_name)
-
 
 hourly_all <- readRDS(here("data/05-11-2025 Report files", "2025_04_12_HEI_hourly_data.rds")) %>%
   filter(!str_starts(location_name, "US Diplomatic Post:")) %>% 
@@ -1752,17 +1665,8 @@ list_pollutants <- c("pm25", "pm10")
 
 cols_to_keep <- c("date", "year", "location_name", "city_name", "district_name", "district_code", "state_name")
 
-ncap_list <- read_xlsx(here("data", "Clean sheet_10-05-2024.xlsx"), sheet = 2) %>%
-  mutate(City_name = ifelse(City_name == "Amaravati", "Amravati", City_name),
-         City_name = ifelse(City_name == "Dharwad", "Hubballi", City_name)) %>%
-  filter(!is.na(City_name)) %>%
-  filter(City_name != 0) %>%
-  distinct(City_name)
 
 pollution_data <- readRDS(here("data/05-11-2025 Report files", "2025_pollutant_data.rds"))
-
-pm25_annual_completeness <- read_csv(here::here("data/2025_PM25_annual_complete_data_station_info.csv"))
-pm10_annual_completeness <- read_csv(here::here("data/2025_PM10_annual_complete_data_station_info.csv"))
 
 pm25_annual_completeness_ncap <- pm25_annual_completeness %>%
   filter(city_name %in% unique(ncap_list$City_name))
@@ -1907,15 +1811,6 @@ list_pollutants <- c("pm25", "pm10")
 
 cols_to_keep <- c("date", "year", "location_name", "city_name", "district_name", "district_code", "state_name")
 
-ncap_list <- read_xlsx(here("data", "Clean sheet_10-05-2024.xlsx"), sheet = 2) %>%
-  mutate(City_name = ifelse(City_name == "Amaravati", "Amravati", City_name),
-         City_name = ifelse(City_name == "Dharwad", "Hubballi", City_name)) %>%
-  filter(!is.na(City_name)) %>%
-  filter(City_name != 0) %>%
-  distinct(City_name)
-
-pm25_annual_completeness <- read_csv(here::here("data/2025_PM25_annual_complete_data_station_info.csv"))
-pm10_annual_completeness <- read_csv(here::here("data/2025_PM10_annual_complete_data_station_info.csv"))
 
 pm25_annual_completeness_ncap <- pm25_annual_completeness %>%
   filter(city_name %in% unique(ncap_list$City_name))
