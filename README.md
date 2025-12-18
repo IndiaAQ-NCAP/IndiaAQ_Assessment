@@ -39,7 +39,7 @@ The data used in this analysis are not publicly available and are therefore not 
 
 Report Reference
 The full report is available at:
-[ link]
+https://www.healtheffects.org/publication/assessment-changes-air-quality-indian-cities-launch-national-clean-air-programme
 
 If you have questions, please contact Abinaya Sekar at asekar@healtheffects.org or Adithi R. Upadhya at adithiru095@gmail.com. 
 
